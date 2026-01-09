@@ -7,6 +7,7 @@ import (
 )
 
 func runStep(s *Step, db Database) {
+	fmt.Printf("Running step %d for task: %s\n", s.ID, s.Task.Name)
 	cmd := exec.Command("sh", "-c", s.Task.Script.String)
 
 	input_file, err := os.CreateTemp("/tmp", "*")
@@ -22,6 +23,7 @@ func runStep(s *Step, db Database) {
 		fmt.Sprintf("OUTPUT_DIR=%s", output_dir),
 	)
 
+	fmt.Printf("  Executing script with INPUT_FILE=%s\n", input_file.Name())
 	_, err = cmd.CombinedOutput()
 	if err != nil {
 		panic(err)
@@ -32,6 +34,7 @@ func runStep(s *Step, db Database) {
 		panic(err)
 	}
 
+	outputCount := 0
 	for _, file := range dirs {
 		if file.IsDir() {
 			continue
@@ -50,6 +53,8 @@ func runStep(s *Step, db Database) {
 		if err != nil {
 			panic(err)
 		}
+		outputCount++
 	}
+	fmt.Printf("  Generated %d output files\n", outputCount)
 
 }

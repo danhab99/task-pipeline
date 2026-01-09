@@ -52,6 +52,7 @@ func NewDatabase(repo_path string) (Database, error) {
 		return Database{}, err
 	}
 
+	log.Printf("Opening database at %s/db\n", repo_path)
 	db, err := sql.Open("sqlite", fmt.Sprintf("%s/db", repo_path))
 	if err != nil {
 		log.Fatal(err)
@@ -61,6 +62,7 @@ func NewDatabase(repo_path string) (Database, error) {
 	db.Exec("PRAGMA synchronous=NORMAL;")
 	db.Exec("PRAGMA foreign_keys=ON;")
 
+	log.Println("Initializing database schema")
 	_, err = db.Exec(schema)
 	if err != nil {
 		return Database{}, err
@@ -226,6 +228,7 @@ func (d Database) InsertStep(s Step) error {
 	hash := hash(s.Object)
 
 	p := d.getObjectPath(hash)
+	log.Printf("Writing object to %s\n", p)
 	err := os.WriteFile(p, s.Object, os.ModeAppend)
 	if err != nil {
 		return err
