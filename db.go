@@ -9,6 +9,8 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+var dbLogger = log.New(os.Stderr, "[DB] ", log.Ldate|log.Ltime|log.Lmsgprefix)
+
 const schema string = `
 CREATE TABLE IF NOT EXISTS task (
   id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -19,13 +21,14 @@ CREATE TABLE IF NOT EXISTS task (
 
 CREATE TABLE IF NOT EXISTS result (
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
-  object_hash      VARCHAR(64) UNIQUE NOT NULL,
-  task_id          INTEGER NOT NULL,
+  object_hash      VARCHAR(64) NOT NULL,
+  task_id          INTEGER,
   input_result_id  INTEGER,
   processed        INTEGER DEFAULT 0,
 
   FOREIGN KEY(task_id) REFERENCES task(id),
-  FOREIGN KEY(input_result_id) REFERENCES result(id)
+  FOREIGN KEY(input_result_id) REFERENCES result(id),
+  UNIQUE(object_hash, task_id, input_result_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_task_name ON task(name);
@@ -40,16 +43,16 @@ type Database struct {
 }
 
 type Task struct {
-	ID       int64
-	Name     string
-	Script   string
-	IsStart  bool
+	ID      int64
+	Name    string
+	Script  string
+	IsStart bool
 }
 
 type Result struct {
 	ID            int64
 	ObjectHash    string
-	TaskID        int64
+	TaskID        *int64
 	InputResultID *int64
 	Processed     bool
 }
@@ -60,7 +63,7 @@ func NewDatabase(repo_path string) (Database, error) {
 		return Database{}, err
 	}
 
-	log.Printf("Opening database at %s/db\n", repo_path)
+	dbLogger.Printf("Opening database at %s/db", repo_path)
 	db, err := sql.Open("sqlite3", fmt.Sprintf("%s/db", repo_path))
 	if err != nil {
 		return Database{}, err
@@ -70,7 +73,7 @@ func NewDatabase(repo_path string) (Database, error) {
 	db.Exec("PRAGMA synchronous=NORMAL;")
 	db.Exec("PRAGMA foreign_keys=ON;")
 
-	log.Println("Initializing database schema")
+	dbLogger.Println("Initializing database schema")
 	_, err = db.Exec(schema)
 	if err != nil {
 		return Database{}, err
@@ -129,6 +132,24 @@ func (d Database) GetTaskByID(id int64) (*Task, error) {
 	return &task, nil
 }
 
+func (d Database) GetResultByID(id int64) (*Result, error) {
+	var r Result
+	err := d.db.QueryRow("SELECT id, object_hash, task_id, input_result_id, processed FROM result WHERE id = ?", id).Scan(
+		&r.ID,
+		&r.ObjectHash,
+		&r.TaskID,
+		&r.InputResultID,
+		&r.Processed,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &r, nil
+}
+
 func (d Database) GetObjectPath(hash string) string {
 	dir := fmt.Sprintf(
 		"%s/objects/%s/%s/%s",
@@ -143,7 +164,7 @@ func (d Database) GetObjectPath(hash string) string {
 	return fmt.Sprintf("%s/%s", dir, hash[6:])
 }
 
-func (d Database) InsertResult(objectHash string, taskID int64, inputResultID *int64) (int64, bool, error) {
+func (d Database) InsertResult(objectHash string, taskID *int64, inputResultID *int64) (int64, bool, error) {
 	res, err := d.db.Exec(`
 INSERT OR IGNORE INTO result (object_hash, task_id, input_result_id, processed)
 VALUES (?, ?, ?, 0);
@@ -164,7 +185,10 @@ VALUES (?, ?, ?, 0);
 
 	// Already exists, get the ID
 	var id int64
-	err = d.db.QueryRow("SELECT id FROM result WHERE object_hash = ?", objectHash).Scan(&id)
+	err = d.db.QueryRow(`
+		SELECT id FROM result 
+		WHERE object_hash = ? AND task_id IS ? AND input_result_id IS ?
+	`, objectHash, taskID, inputResultID).Scan(&id)
 	return id, false, err
 }
 
@@ -172,7 +196,7 @@ func (d Database) GetUnprocessedResults() ([]Result, error) {
 	rows, err := d.db.Query(`
 		SELECT r.id, r.object_hash, r.task_id, r.input_result_id
 		FROM result r
-		WHERE r.processed = 0
+		WHERE r.processed = 0 AND r.task_id IS NOT NULL
 		ORDER BY r.id
 	`)
 	if err != nil {
@@ -203,11 +227,11 @@ func (d Database) MarkResultProcessed(resultID int64) error {
 	return err
 }
 
-func (d Database) GetResultsByTaskName(name string, mode string) ([]string, error) {
+func (d Database) GetResultsByTaskName(name string, mode string) ([]Result, error) {
 	var query string
 	if mode == "input" {
 		query = `
-			SELECT r.object_hash
+			SELECT r.id, r.object_hash, r.task_id, r.input_result_id, r.processed
 			FROM result r
 			JOIN task t ON r.task_id = t.id
 			WHERE t.name = ?
@@ -216,7 +240,7 @@ func (d Database) GetResultsByTaskName(name string, mode string) ([]string, erro
 	} else {
 		// output mode - get results created by this task
 		query = `
-			SELECT r2.object_hash
+			SELECT r2.id, r2.object_hash, r2.task_id, r2.input_result_id, r2.processed
 			FROM result r1
 			JOIN task t ON r1.task_id = t.id
 			JOIN result r2 ON r2.input_result_id = r1.id
@@ -231,16 +255,16 @@ func (d Database) GetResultsByTaskName(name string, mode string) ([]string, erro
 	}
 	defer rows.Close()
 
-	var hashes []string
+	var results []Result
 	for rows.Next() {
-		var hash string
-		if err := rows.Scan(&hash); err != nil {
+		var r Result
+		if err := rows.Scan(&r.ID, &r.ObjectHash, &r.TaskID, &r.InputResultID, &r.Processed); err != nil {
 			return nil, err
 		}
-		hashes = append(hashes, hash)
+		results = append(results, r)
 	}
 
-	return hashes, rows.Err()
+	return results, rows.Err()
 }
 
 func (d Database) GetStartTask() (*Task, error) {

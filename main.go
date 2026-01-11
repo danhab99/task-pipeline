@@ -2,12 +2,14 @@ package main
 
 import (
 	"flag"
-	"fmt"
+	"log"
 	"os"
 	"runtime"
 
 	"github.com/pelletier/go-toml"
 )
+
+var mainLogger = log.New(os.Stderr, "[MAIN] ", log.Ldate|log.Ltime|log.Lmsgprefix)
 
 func main() {
 	manifest_path := flag.String("manifest", "", "manifest path")
@@ -19,7 +21,7 @@ func main() {
 
 	flag.Parse()
 
-	fmt.Printf("Loading manifest from: %s\n", *manifest_path)
+	mainLogger.Printf("Loading manifest from: %s", *manifest_path)
 
 	manifest_toml, err := os.ReadFile(*manifest_path)
 	if err != nil {
@@ -31,9 +33,9 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("Loaded %d tasks from manifest\n", len(manifest.Tasks))
+	mainLogger.Printf("Loaded %d tasks from manifest", len(manifest.Tasks))
 
-	fmt.Printf("Initializing database at: %s\n", *db_path)
+	mainLogger.Printf("Initializing database at: %s", *db_path)
 	database, err := NewDatabase(*db_path)
 	if err != nil {
 		panic(err)

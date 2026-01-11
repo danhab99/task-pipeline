@@ -1,34 +1,38 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
 	"sync"
 )
 
+var runLogger = log.New(os.Stderr, "[RUN] ", log.Ldate|log.Ltime|log.Lmsgprefix)
+
 func extractTaskName(filename string) string {
 	base := filename
 	if idx := strings.LastIndex(filename, "."); idx != -1 {
 		base = filename[:idx]
 	}
-	
+
 	if idx := strings.Index(base, "_"); idx != -1 {
 		return base[:idx]
 	}
-	
+
 	return base
 }
 
 func run(manifest Manifest, database Database, parallel int) {
-	fmt.Println("Registering tasks...")
+	runLogger.Println("Registering tasks...")
 	for _, task := range manifest.Tasks {
-		fmt.Printf("  - %s", task.Name)
 		if task.Start {
-			fmt.Printf(" (START TASK)")
+			runLogger.Printf("Task: %s (START TASK)", task.Name)
+		} else {
+			runLogger.Printf("Task: %s", task.Name)
 		}
-		fmt.Println()
 		database.RegisterTask(task.Name, task.Script, task.Start)
 	}
 
@@ -44,8 +48,8 @@ func run(manifest Manifest, database Database, parallel int) {
 		}
 
 		if len(unprocessed) == 0 {
-			fmt.Println("Seeding start task:", startTask.Name)
-			database.InsertResult("", startTask.ID, nil)
+			runLogger.Printf("Seeding start task: %s", startTask.Name)
+			database.InsertResult("", &startTask.ID, nil)
 		}
 	}
 
@@ -73,7 +77,7 @@ func run(manifest Manifest, database Database, parallel int) {
 			break
 		}
 
-		fmt.Printf("\nProcessing %d results...\n", len(unprocessed))
+		runLogger.Printf("Processing %d results...", len(unprocessed))
 		for _, result := range unprocessed {
 			jobs <- result
 			totalProcessed++
@@ -97,16 +101,16 @@ func run(manifest Manifest, database Database, parallel int) {
 	close(jobs)
 	wg.Wait()
 
-	fmt.Printf("\nCompleted processing %d results\n", totalProcessed)
+	runLogger.Printf("Completed processing %d results", totalProcessed)
 }
 
 func processResult(r Result, db Database) {
-	task, err := db.GetTaskByID(r.TaskID)
+	task, err := db.GetTaskByID(*r.TaskID)
 	if err != nil {
 		panic(err)
 	}
 
-	fmt.Printf("Processing result %d for task '%s'\n", r.ID, task.Name)
+	runLogger.Printf("Processing result %d for task '%s'", r.ID, task.Name)
 
 	err = db.MarkResultProcessed(r.ID)
 	if err != nil {
@@ -125,13 +129,13 @@ func processResult(r Result, db Database) {
 		if err != nil {
 			panic(err)
 		}
-		fmt.Printf("  Input: %d bytes from %s\n", len(data), r.ObjectHash[:16]+"...")
+		runLogger.Printf("  Input: %d bytes from %s", len(data), r.ObjectHash[:16]+"...")
 		_, err = inputFile.Write(data)
 		if err != nil {
 			panic(err)
 		}
 	} else {
-		fmt.Printf("  Input: (empty - start task)\n")
+		runLogger.Println("  Input: (empty - start task)")
 	}
 	inputFile.Close()
 
@@ -141,15 +145,58 @@ func processResult(r Result, db Database) {
 	}
 	defer os.RemoveAll(outputDir)
 
+	runLogger.Printf("  Executing script for task '%s'", task.Name)
 	cmd := exec.Command("sh", "-c", task.Script)
 	cmd.Env = append(os.Environ(),
 		fmt.Sprintf("INPUT_FILE=%s", inputFile.Name()),
 		fmt.Sprintf("OUTPUT_DIR=%s", outputDir),
 	)
 
-	output, err := cmd.CombinedOutput()
+	// Capture stdout and stderr
+	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		fmt.Printf("  Error executing script: %s\n", string(output))
+		panic(err)
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		panic(err)
+	}
+
+	// Start the command
+	if err := cmd.Start(); err != nil {
+		runLogger.Printf("  Error starting script: %v", err)
+		panic(err)
+	}
+
+	// Create a script logger for this specific task
+	scriptLogger := log.New(os.Stderr, fmt.Sprintf("[SCRIPT:%s] ", task.Name), log.Ldate|log.Ltime|log.Lmsgprefix)
+
+	// Stream stdout
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(stdoutPipe)
+		for scanner.Scan() {
+			scriptLogger.Println(scanner.Text())
+		}
+	}()
+
+	// Stream stderr
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(stderrPipe)
+		for scanner.Scan() {
+			scriptLogger.Printf("[stderr] %s", scanner.Text())
+		}
+	}()
+
+	// Wait for output streaming to complete
+	wg.Wait()
+
+	// Wait for command to complete
+	if err := cmd.Wait(); err != nil {
+		runLogger.Printf("  Error executing script: %v", err)
 		panic(err)
 	}
 
@@ -169,16 +216,20 @@ func processResult(r Result, db Database) {
 		taskName := extractTaskName(filename)
 		filePath := fmt.Sprintf("%s/%s", outputDir, filename)
 
-		fmt.Printf("  Output: %s -> task '%s'\n", filename, taskName)
+		runLogger.Printf("  Output: %s -> task '%s'", filename, taskName)
 
 		targetTask, err := db.GetTaskByName(taskName)
 		if err != nil {
-			fmt.Printf("    Warning: Error looking up task '%s': %v\n", taskName, err)
+			runLogger.Printf("    Warning: Error looking up task '%s': %v", taskName, err)
 			continue
 		}
-		if targetTask == nil {
-			fmt.Printf("    Warning: Task '%s' not found, skipping\n", taskName)
-			continue
+
+		var taskID *int64
+		if targetTask != nil {
+			taskID = &targetTask.ID
+		} else {
+			runLogger.Printf("    (terminal output - no task '%s')", taskName)
+			// taskID remains nil for terminal results
 		}
 
 		hash, err := hashFileSHA256(filePath)
@@ -192,7 +243,7 @@ func processResult(r Result, db Database) {
 			panic(err)
 		}
 
-		_, isNew, err := db.InsertResult(hash, targetTask.ID, &r.ID)
+		_, isNew, err := db.InsertResult(hash, taskID, &r.ID)
 		if err != nil {
 			panic(err)
 		}
@@ -204,5 +255,5 @@ func processResult(r Result, db Database) {
 		}
 	}
 
-	fmt.Printf("  Created %d new results, %d already existed\n", newCount, skippedCount)
+	runLogger.Printf("  Created %d new results, %d already existed", newCount, skippedCount)
 }
