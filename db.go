@@ -217,13 +217,32 @@ func (d Database) ListSteps() chan Step {
 
 func (d Database) CreateTask(objectHash string, stepID *int64, inputTaskID *int64) (int64, error) {
 	res, err := d.db.Exec(`
-INSERT INTO task (object_hash, step_id, input_task_id, processed)
-VALUES (?, ?, ?, 0)
+INSERT OR IGNORE INTO task (object_hash, step_id, input_task_id, processed)
+VALUES (?, ?, ?, 0);
 `, objectHash, stepID, inputTaskID)
 	if err != nil {
 		return 0, err
 	}
-	return res.LastInsertId()
+
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+
+	// If LastInsertId is 0, the insert was ignored (duplicate), so query for existing task
+	if id == 0 {
+		var existingID int64
+		err := d.db.QueryRow(`
+			SELECT id FROM task 
+			WHERE object_hash = ? AND step_id = ? AND (input_task_id = ? OR (input_task_id IS NULL AND ? IS NULL))
+		`, objectHash, stepID, inputTaskID, inputTaskID).Scan(&existingID)
+		if err != nil {
+			return 0, fmt.Errorf("failed to find existing task after ignored insert: %w", err)
+		}
+		return existingID, nil
+	}
+
+	return id, nil
 }
 
 func (d Database) GetTask(id int64) (*Task, error) {

@@ -49,23 +49,35 @@ func (p *Pipeline) Execute(startStepName string, maxParallel int) int {
 			parallel = *step.Parallel
 		}
 
+		var parallelWg sync.WaitGroup
+		go func() {
+			parallelWg.Wait()
+			close(msgBus[step.Name])
+		}()
+
 		for range parallel {
 			wg.Add(1)
+			parallelWg.Add(1)
 			go func() {
 				defer wg.Done()
-				defer close(msgBus[step.Name])
+				defer parallelWg.Done()
 
 				tasksChan := db.GetUnprocessedTasks(step.ID)
 
 				for task := range chans.Merge(msgBus[step.Name], tasksChan) {
-					resourcePool <- struct{}{}        // acquire
-					defer func() { <-resourcePool }() // release
+					resourcePool <- struct{}{} // acquire
 
 					nextTasks := p.ExecuteTask(task)
 					numberOfExecutions++
 
+					<-resourcePool // release immediately after task completes
+
 					for nextTask := range nextTasks {
-						msgBus[step.Name] <- nextTask
+						nextStepInfo, err := db.GetStep(*nextTask.StepID)
+						if err != nil {
+							panic(err)
+						}
+						msgBus[nextStepInfo.Name] <- nextTask
 					}
 				}
 			}()
@@ -194,13 +206,17 @@ func (p Pipeline) ExecuteTask(t Task) chan Task {
 		}
 	}()
 
-	newCount := 0
-	skippedCount := 0
+	// Buffer size should accommodate all potential outputs to prevent blocking
+	outputTasks := make(chan Task, len(entries))
 
-	outputTasks := make(chan Task)
+	var workerWg sync.WaitGroup
+	workerWg.Add(1)
+
+	defer workerWg.Wait()
 
 	go func() {
 		defer close(outputTasks)
+		defer workerWg.Done()
 
 		workers.Parallel0(entriesChan, runtime.NumCPU(), func(entry os.DirEntry) {
 			if entry.IsDir() {
@@ -222,8 +238,7 @@ func (p Pipeline) ExecuteTask(t Task) chan Task {
 			}
 
 			if isCompleted {
-				fmt.Printf("This step is already completed %s\n", t.ID)
-				skippedCount++
+				fmt.Printf("This step is already completed %d\n", t.ID)
 				return
 			}
 
@@ -234,10 +249,16 @@ func (p Pipeline) ExecuteTask(t Task) chan Task {
 				panic(err)
 			}
 
+			// Only set InputTaskID if current task has a valid DB ID
+			var inputTaskID *int64
+			if t.ID > 0 {
+				inputTaskID = &t.ID
+			}
+
 			outputTasks <- Task{
 				ObjectHash:  hash,
 				StepID:      &nextStep.ID,
-				InputTaskID: &t.ID,
+				InputTaskID: inputTaskID,
 				Processed:   isCompleted,
 			}
 
@@ -247,16 +268,12 @@ func (p Pipeline) ExecuteTask(t Task) chan Task {
 				panic(err)
 			}
 
-			_, err = db.CreateTask(hash, &nextStep.ID, &t.ID)
+			_, err = db.CreateTask(hash, &nextStep.ID, inputTaskID)
 			if err != nil {
 				panic(err)
 			}
-
-			newCount++
 		})
 	}()
-
-	runLogger.Printf("  Created %d new tasks, %d already existed", newCount, skippedCount)
 
 	return outputTasks
 }
