@@ -1,10 +1,10 @@
 package main
 
 type Manifest struct {
-	Tasks []ManifestTask `toml:"task"`
+	Steps []ManifestStep `toml:"step"`
 }
 
-type ManifestTask struct {
+type ManifestStep struct {
 	Name     string `toml:"name"`
 	Script   string `toml:"script"`
 	Start    bool   `toml:"start"`

@@ -22,6 +22,8 @@
               gopls
               delve
               sqlite
+              texliveTeTeX
+              pandoc
             ];
 
             GO_PATH="${self.outPath}/.go";

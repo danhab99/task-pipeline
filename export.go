@@ -8,29 +8,29 @@ import (
 
 var exportLogger = log.New(os.Stderr, "[EXPORT] ", log.Ldate|log.Ltime|log.Lmsgprefix)
 
-func exportResults(database Database, taskName string, mode string) {
-	exportLogger.Printf("Exporting %s for task '%s'", mode, taskName)
+func exportResults(database Database, stepName string, mode string) {
+	exportLogger.Printf("Exporting %s for step '%s'", mode, stepName)
 
-	results, err := database.GetResultsByTaskName(taskName, mode)
+	tasks, err := database.GetTasksByStepName(stepName, mode)
 	if err != nil {
 		panic(err)
 	}
 
-	exportLogger.Printf("Found %d results", len(results))
+	exportLogger.Printf("Found %d tasks", len(tasks))
 
-	for _, result := range results {
-		objectPath := database.GetObjectPath(result.ObjectHash)
+	for _, task := range tasks {
+		objectPath := database.GetObjectPath(task.ObjectHash)
 
-		if mode == "output" && result.InputResultID != nil {
-			// Get the input result to show which specific input produced this output
-			inputResult, err := database.GetResultByID(*result.InputResultID)
+		if mode == "output" && task.InputTaskID != nil {
+			// Get the input task to show which specific input produced this output
+			inputTask, err := database.GetTaskByID(*task.InputTaskID)
 			if err != nil {
-				exportLogger.Printf("Warning: Could not get input result: %v", err)
+				exportLogger.Printf("Warning: Could not get input task: %v", err)
 				fmt.Println(objectPath)
 				continue
 			}
 
-			inputHash := inputResult.ObjectHash
+			inputHash := inputTask.ObjectHash
 			if len(inputHash) > 16 {
 				inputHash = inputHash[:16] + "..."
 			}

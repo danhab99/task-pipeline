@@ -12,7 +12,7 @@ import (
 
 var runLogger = log.New(os.Stderr, "[RUN] ", log.Ldate|log.Ltime|log.Lmsgprefix)
 
-func extractTaskName(filename string) string {
+func extractStepName(filename string) string {
 	base := filename
 	if idx := strings.LastIndex(filename, "."); idx != -1 {
 		base = filename[:idx]
@@ -25,116 +25,116 @@ func extractTaskName(filename string) string {
 	return base
 }
 
-func run(manifest Manifest, database Database, parallel int, startTaskName string) {
-	runLogger.Println("Registering tasks...")
-	for _, task := range manifest.Tasks {
-		if task.Start {
-			runLogger.Printf("Task: %s (START TASK)", task.Name)
+func run(manifest Manifest, database Database, parallel int, startStepName string) {
+	runLogger.Println("Registering steps...")
+	for _, step := range manifest.Steps {
+		if step.Start {
+			runLogger.Printf("Step: %s (START STEP)", step.Name)
 		} else {
-			runLogger.Printf("Task: %s", task.Name)
+			runLogger.Printf("Step: %s", step.Name)
 		}
-		if task.Parallel != nil {
-			runLogger.Printf("  Parallel limit: %d", *task.Parallel)
+		if step.Parallel != nil {
+			runLogger.Printf("  Parallel limit: %d", *step.Parallel)
 		}
-		database.RegisterTask(task.Name, task.Script, task.Start, task.Parallel)
+		database.RegisterStep(step.Name, step.Script, step.Start, step.Parallel)
 	}
 
-	// Determine which task to start from
-	var startTask *Task
+	// Determine which step to start from
+	var startStep *Step
 	var err error
 
-	if startTaskName != "" {
-		runLogger.Printf("Starting from task: %s", startTaskName)
-		startTask, err = database.GetTaskByName(startTaskName)
+	if startStepName != "" {
+		runLogger.Printf("Starting from step: %s", startStepName)
+		startStep, err = database.GetStepByName(startStepName)
 		if err != nil {
 			panic(err)
 		}
-		if startTask == nil {
-			panic(fmt.Sprintf("Task '%s' not found", startTaskName))
+		if startStep == nil {
+			panic(fmt.Sprintf("Step '%s' not found", startStepName))
 		}
 
-		// Mark all results for this task as unprocessed to re-run them
-		count, err := database.MarkTaskResultsUnprocessed(startTaskName)
+		// Mark all tasks for this step as unprocessed to re-run them
+		count, err := database.MarkStepTasksUnprocessed(startStepName)
 		if err != nil {
 			panic(err)
 		}
 		if count > 0 {
-			runLogger.Printf("Marked %d existing results as unprocessed for task '%s'", count, startTaskName)
+			runLogger.Printf("Marked %d existing tasks as unprocessed for step '%s'", count, startStepName)
 		} else {
-			// No existing results, create an initial empty one
-			_, _, err := database.InsertResult("", &startTask.ID, nil)
+			// No existing tasks, create an initial empty one
+			_, _, err := database.InsertTask("", &startStep.ID, nil)
 			if err != nil {
 				panic(err)
 			}
-			runLogger.Printf("Created initial result for task '%s' (no existing results found)", startTask.Name)
+			runLogger.Printf("Created initial task for step '%s' (no existing tasks found)", startStep.Name)
 		}
 	} else {
-		startTask, err = database.GetStartTask()
+		startStep, err = database.GetStartStep()
 		if err != nil {
 			panic(err)
 		}
-		if startTask == nil {
-			panic("No start task found in manifest")
+		if startStep == nil {
+			panic("No start step found in manifest")
 		}
-		runLogger.Printf("Starting from default start task: %s", startTask.Name)
+		runLogger.Printf("Starting from default start step: %s", startStep.Name)
 
-		// Create initial result for the start task if it doesn't exist
-		_, isNew, err := database.InsertResult("", &startTask.ID, nil)
+		// Create initial task for the start step if it doesn't exist
+		_, isNew, err := database.InsertTask("", &startStep.ID, nil)
 		if err != nil {
 			panic(err)
 		}
 		if isNew {
-			runLogger.Printf("Created initial result for task '%s'", startTask.Name)
+			runLogger.Printf("Created initial task for step '%s'", startStep.Name)
 		} else {
-			runLogger.Printf("Initial result for task '%s' already exists", startTask.Name)
+			runLogger.Printf("Initial task for step '%s' already exists", startStep.Name)
 		}
 	}
 
-	// Track semaphores for per-task parallelism limits
-	taskSemaphores := make(map[int64]chan struct{})
+	// Track semaphores for per-step parallelism limits
+	stepSemaphores := make(map[int64]chan struct{})
 	var semMutex sync.Mutex
 
 	var wg sync.WaitGroup
-	jobs := make(chan Result, parallel)
+	jobs := make(chan Task, parallel)
 
-	// Worker function that respects per-task parallelism
-	processWithLimit := func(result Result, db Database) {
-		// Get task to check for parallelism limit
-		task, err := db.GetTaskByID(*result.TaskID)
+	// Worker function that respects per-step parallelism
+	processWithLimit := func(task Task, db Database) {
+		// Get step to check for parallelism limit
+		step, err := db.GetStepByID(*task.StepID)
 		if err != nil {
 			panic(err)
 		}
 
-		// Acquire slot from task-specific semaphore if limit is set
+		// Acquire slot from step-specific semaphore if limit is set
 		var sem chan struct{}
-		if task.Parallel != nil {
+		if step.Parallel != nil {
 			semMutex.Lock()
-			if taskSemaphores[task.ID] == nil {
-				taskSemaphores[task.ID] = make(chan struct{}, *task.Parallel)
+			if stepSemaphores[step.ID] == nil {
+				stepSemaphores[step.ID] = make(chan struct{}, *step.Parallel)
 			}
-			sem = taskSemaphores[task.ID]
+			sem = stepSemaphores[step.ID]
 			semMutex.Unlock()
 
 			sem <- struct{}{}        // Acquire
 			defer func() { <-sem }() // Release
 		}
 
-		result.deriveResults(db)
+		task.deriveTasks(db)
 	}
 
 	for i := 0; i < parallel; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for result := range jobs {
-				processWithLimit(result, database)
+			for task := range jobs {
+				processWithLimit(task, database)
 			}
 		}()
 	}
 
 	totalProcessed := 0
 	for {
-		unprocessed, err := database.GetUnprocessedResults()
+		unprocessed, err := database.GetUnprocessedTasks()
 		if err != nil {
 			panic(err)
 		}
@@ -143,22 +143,22 @@ func run(manifest Manifest, database Database, parallel int, startTaskName strin
 			break
 		}
 
-		runLogger.Printf("Processing %d unprocessed results...", len(unprocessed))
-		for _, result := range unprocessed {
-			jobs <- result
+		runLogger.Printf("Processing %d unprocessed tasks...", len(unprocessed))
+		for _, task := range unprocessed {
+			jobs <- task
 			totalProcessed++
 		}
 
 		close(jobs)
 		wg.Wait()
 
-		jobs = make(chan Result, parallel)
+		jobs = make(chan Task, parallel)
 		for i := 0; i < parallel; i++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				for result := range jobs {
-					processWithLimit(result, database)
+				for task := range jobs {
+					processWithLimit(task, database)
 				}
 			}()
 		}
@@ -167,18 +167,18 @@ func run(manifest Manifest, database Database, parallel int, startTaskName strin
 	close(jobs)
 	wg.Wait()
 
-	runLogger.Printf("Completed processing %d results", totalProcessed)
+	runLogger.Printf("Completed processing %d tasks", totalProcessed)
 }
 
-func (r Result) deriveResults(db Database) {
-	task, err := db.GetTaskByID(*r.TaskID)
+func (t Task) deriveTasks(db Database) {
+	step, err := db.GetStepByID(*t.StepID)
 	if err != nil {
 		panic(err)
 	}
 
-	runLogger.Printf("Processing result %d for task '%s'", r.ID, task.Name)
+	runLogger.Printf("Processing task %d for step '%s'", t.ID, step.Name)
 
-	err = db.MarkResultProcessed(r.ID)
+	err = db.MarkTaskProcessed(t.ID)
 	if err != nil {
 		panic(err)
 	}
@@ -189,19 +189,19 @@ func (r Result) deriveResults(db Database) {
 	}
 	defer os.Remove(inputFile.Name())
 
-	if r.ObjectHash != "" {
-		objectPath := db.GetObjectPath(r.ObjectHash)
+	if t.ObjectHash != "" {
+		objectPath := db.GetObjectPath(t.ObjectHash)
 		data, err := os.ReadFile(objectPath)
 		if err != nil {
 			panic(err)
 		}
-		runLogger.Printf("  Input: %d bytes from %s", len(data), r.ObjectHash[:16]+"...")
+		runLogger.Printf("  Input: %d bytes from %s", len(data), t.ObjectHash[:16]+"...")
 		_, err = inputFile.Write(data)
 		if err != nil {
 			panic(err)
 		}
 	} else {
-		runLogger.Println("  Input: (empty - start task)")
+		runLogger.Println("  Input: (empty - start step)")
 	}
 	inputFile.Close()
 
@@ -211,8 +211,8 @@ func (r Result) deriveResults(db Database) {
 	}
 	defer os.RemoveAll(outputDir)
 
-	runLogger.Printf("  Executing script for task '%s'", task.Name)
-	cmd := exec.Command("sh", "-c", task.Script)
+	runLogger.Printf("  Executing script for step '%s'", step.Name)
+	cmd := exec.Command("sh", "-c", step.Script)
 	cmd.Env = append(os.Environ(),
 		fmt.Sprintf("INPUT_FILE=%s", inputFile.Name()),
 		fmt.Sprintf("OUTPUT_DIR=%s", outputDir),
@@ -234,8 +234,8 @@ func (r Result) deriveResults(db Database) {
 		panic(err)
 	}
 
-	// Create a script logger for this specific task
-	scriptLogger := log.New(os.Stderr, fmt.Sprintf("[SCRIPT:%s] ", task.Name), log.Ldate|log.Ltime|log.Lmsgprefix)
+	// Create a script logger for this specific step
+	scriptLogger := log.New(os.Stderr, fmt.Sprintf("[SCRIPT:%s] ", step.Name), log.Ldate|log.Ltime|log.Lmsgprefix)
 
 	// Stream stdout
 	var wg sync.WaitGroup
@@ -279,23 +279,23 @@ func (r Result) deriveResults(db Database) {
 		}
 
 		filename := entry.Name()
-		taskName := extractTaskName(filename)
+		stepName := extractStepName(filename)
 		filePath := fmt.Sprintf("%s/%s", outputDir, filename)
 
-		runLogger.Printf("  Output: %s -> task '%s'", filename, taskName)
+		runLogger.Printf("  Output: %s -> step '%s'", filename, stepName)
 
-		targetTask, err := db.GetTaskByName(taskName)
+		targetStep, err := db.GetStepByName(stepName)
 		if err != nil {
-			runLogger.Printf("    Warning: Error looking up task '%s': %v", taskName, err)
+			runLogger.Printf("    Warning: Error looking up step '%s': %v", stepName, err)
 			continue
 		}
 
-		var taskID *int64
-		if targetTask != nil {
-			taskID = &targetTask.ID
+		var stepID *int64
+		if targetStep != nil {
+			stepID = &targetStep.ID
 		} else {
-			runLogger.Printf("    (terminal output - no task '%s')", taskName)
-			// taskID remains nil for terminal results
+			runLogger.Printf("    (terminal output - no step '%s')", stepName)
+			// stepID remains nil for terminal results
 		}
 
 		hash, err := hashFileSHA256(filePath)
@@ -309,7 +309,7 @@ func (r Result) deriveResults(db Database) {
 			panic(err)
 		}
 
-		_, isNew, err := db.InsertResult(hash, taskID, &r.ID)
+		_, isNew, err := db.InsertTask(hash, stepID, &t.ID)
 		if err != nil {
 			panic(err)
 		}
@@ -321,5 +321,5 @@ func (r Result) deriveResults(db Database) {
 		}
 	}
 
-	runLogger.Printf("  Created %d new results, %d already existed", newCount, skippedCount)
+	runLogger.Printf("  Created %d new tasks, %d already existed", newCount, skippedCount)
 }
