@@ -22,16 +22,31 @@ func extractStepName(filename string) string {
 }
 
 func run(manifest Manifest, database Database, parallel int, startStepName string) {
+	runLogger.Println("Registered steps")
 
 	for _, step := range manifest.Steps {
-		database.CreateStep(step.Name, step.Script, step.Start, step.Parallel)
+		database.CreateStep(Step{
+			Name: step.Name,
+			Script: step.Script,
+			IsStart: step.Start,
+			Parallel: step.Parallel,
+		})
 	}
+
+	runLogger.Println("Stubbed done task")
+	database.CreateStep(Step{
+		Name: "done", 
+		Script: "true",
+		IsStart: false,
+		Parallel: nil,
+	})
 
 	pipeline := NewPipeline(&database)
 
-	totalExecCount := 0
-	execCount := 1
+	totalExecCount := int64(0)
+	execCount := int64(1)
 	for execCount > 0 {
+		runLogger.Println("--- BEGIN EXECUTION ---")
 		c := pipeline.Execute(startStepName, parallel)
 		execCount = c
 		totalExecCount += c

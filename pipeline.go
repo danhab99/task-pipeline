@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"runtime"
@@ -22,87 +23,109 @@ func NewPipeline(d *Database) Pipeline {
 	return Pipeline{d}
 }
 
-func (p *Pipeline) Execute(startStepName string, maxParallel int) int {
+var pipelineLogger = log.New(os.Stderr, "[PIPELINE] ", log.Ldate|log.Ltime|log.Lmsgprefix)
+
+func (p *Pipeline) Execute(startStepName string, maxParallel int) int64 {
 	db := p.db
-	numberOfExecutions := 0
+	var numberOfExecutions int64
 
-	steps := db.ListSteps()
-
-	msgBus := make(map[string]chan Task)
-
-	var wg sync.WaitGroup
-
-	resourcePool := make(chan struct{}, 20) // capacity = max concurrent work
-
-	stepsCount, err := db.CountStepsWithoutParallel()
-	if err != nil {
-		panic(err)
+	steps := <-chans.Accumulate(db.ListSteps())
+	stepsIndex := make(map[int64]Step)
+	for _, s := range steps {
+		stepsIndex[s.ID] = s
 	}
 
-	for step := range steps {
-		msgBus[step.Name] = make(chan Task, 1000)
+	recycle := make(chan Task, 10000)
+	var recycleWg sync.WaitGroup
 
-		parallel := 0
-		if step.Parallel == nil {
-			parallel = maxParallel / int(stepsCount)
-		} else {
-			parallel = *step.Parallel
-		}
+	unprocessedTasks := p.IterateUnprocessed()
+	seedTasks := p.Seed()
 
-		var parallelWg sync.WaitGroup
-		go func() {
-			parallelWg.Wait()
-			close(msgBus[step.Name])
-		}()
+	inputTasks := chans.Merge(recycle, unprocessedTasks, seedTasks)
 
-		for range parallel {
-			wg.Add(1)
-			parallelWg.Add(1)
-			go func() {
-				defer wg.Done()
-				defer parallelWg.Done()
+	type ScheduledTask struct {
+		task Task
+		done chan any
+	}
 
-				tasksChan := db.GetUnprocessedTasks(step.ID)
+	scheduledTasks := make(chan ScheduledTask)
 
-				for task := range chans.Merge(msgBus[step.Name], tasksChan) {
-					resourcePool <- struct{}{} // acquire
+	recycleWg.Add(1)
+	go func() {
+		defer close(scheduledTasks)
+		defer recycleWg.Done()
+		defer pipelineLogger.Println("Scheduling goroutine quitting")
 
-					nextTasks := p.ExecuteTask(task)
-					numberOfExecutions++
+		resourceMap := make(map[int64]int)
 
-					<-resourcePool // release immediately after task completes
+		for uTask := range inputTasks {
+			resourceMap[uTask.ID]++
+			id := *uTask.StepID
 
-					for nextTask := range nextTasks {
-						if nextTask.StepID != nil {
-							nextStepInfo, err := db.GetStep(*nextTask.StepID)
-							if err != nil {
-								panic(err)
-							}
-							msgBus[nextStepInfo.Name] <- nextTask
-						}
-					}
+			if stepsIndex[id].Parallel == nil {
+				doneChan := make(chan any)
+				go func() {
+					<-doneChan
+					resourceMap[*uTask.StepID]--
+				}()
+
+				pipelineLogger.Printf("Acquired lock for %d, %d\n", &uTask.StepID, uTask.ID)
+
+				scheduledTasks <- ScheduledTask{
+					task: uTask,
+					done: doneChan,
 				}
-			}()
+			} else if resourceMap[id] <= *stepsIndex[id].Parallel {
+				doneChan := make(chan any)
+				go func() {
+					<-doneChan
+					resourceMap[*uTask.StepID]--
+				}()
+
+				pipelineLogger.Printf("Acquired lock for %d, %d\n", &uTask.StepID, uTask.ID)
+
+				scheduledTasks <- ScheduledTask{
+					task: uTask,
+					done: doneChan,
+				}
+			} else {
+				recycle <- uTask
+			}
 		}
+	}()
+
+	type SaveTask Task
+	saveChan := make(chan SaveTask)
+	updateChan := make(chan Task)
+
+	go func() {
+		defer close(saveChan)
+		defer close(updateChan)
+
+		workers.Parallel0(scheduledTasks, maxParallel, func(inTask ScheduledTask) {
+			task := inTask.task
+
+			pipelineLogger.Printf("Executing taskID=%d\n", inTask.task.ID)
+			nextTasks := p.ExecuteTask(task)
+			numberOfExecutions++
+
+			for nextTask := range nextTasks {
+				saveChan <- SaveTask(nextTask)
+				updateChan <- nextTask
+			}
+		})
+	}()
+
+	go func() {
+		recycleWg.Wait()
+		close(recycle)
+	}()
+
+	for task := range updateChan {
+		pipelineLogger.Printf("Task %d is complete\n", task.ID)
+		db.UpdateTaskStatus(task.ID, true, nil)
 	}
 
-	var startStep *Step
-
-	if startStepName == "" {
-		startStep, err = db.GetStartingStep()
-	} else {
-		startStep, err = db.GetStepByName(startStepName)
-	}
-
-	if err != nil {
-		panic(err)
-	}
-
-	msgBus[startStep.Name] <- Task{
-		StepID: &startStep.ID,
-	}
-
-	wg.Wait()
 	return numberOfExecutions
 }
 
@@ -184,7 +207,7 @@ func (p Pipeline) ExecuteTask(t Task) chan Task {
 		defer wg.Done()
 		scanner := bufio.NewScanner(stderrPipe)
 		for scanner.Scan() {
-			scriptLogger.Printf("[stderr] %s", scanner.Text())
+			// scriptLogger.Printf("[stderr] %s", scanner.Text())
 		}
 	}()
 
@@ -277,12 +300,52 @@ func (p Pipeline) ExecuteTask(t Task) chan Task {
 				panic(err)
 			}
 
-			_, err = db.CreateTask(hash, t.StepID, inputTaskID)
-			if err != nil {
-				panic(err)
+			if !isCompleted {
+				_, err = db.CreateTask(Task{
+					ObjectHash:  hash,
+					StepID:      t.StepID,
+					InputTaskID: inputTaskID,
+				})
+				if err != nil {
+					panic(err)
+				}
 			}
 		})
 	}()
 
 	return outputTasks
+}
+
+func (p Pipeline) IterateUnprocessed() chan Task {
+	db := p.db
+
+	var tasksChans []chan Task
+
+	for step := range db.ListSteps() {
+		c := db.GetUnprocessedTasks(step.ID)
+		tasksChans = append(tasksChans, c)
+	}
+
+	return chans.Merge(tasksChans...)
+}
+
+func infiniteBuffer[T any](inChan chan T) chan T {
+	outChan := make(chan T)
+	chans.GiantChan(inChan, outChan, math.MaxUint64)
+	return outChan
+}
+
+func (p Pipeline) Seed() chan Task {
+	db := p.db
+
+	startStep, err := db.GetStartingStep()
+	if err != nil {
+		panic(err)
+	}
+
+	t := Task{
+		StepID: &startStep.ID,
+	}
+
+	return p.ExecuteTask(t)
 }

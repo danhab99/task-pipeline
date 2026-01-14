@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS task (
   step_id          INTEGER,
   input_task_id    INTEGER,
   processed        INTEGER DEFAULT 0,
+  error            TEXT,
 
   FOREIGN KEY(step_id) REFERENCES step(id),
   FOREIGN KEY(input_task_id) REFERENCES task(id),
@@ -57,6 +58,7 @@ type Task struct {
 	StepID      *int64
 	InputTaskID *int64
 	Processed   bool
+	Error       *string
 }
 
 func NewDatabase(repo_path string) (Database, error) {
@@ -86,11 +88,11 @@ func NewDatabase(repo_path string) (Database, error) {
 
 // Step CRUD operations
 
-func (d Database) CreateStep(name, script string, isStart bool, parallel *int) (int64, error) {
+func (d Database) CreateStep(step Step) (int64, error) {
 	res, err := d.db.Exec(`
 INSERT INTO step (name, script, is_start, parallel)
 VALUES (?, ?, ?, ?)
-`, name, script, isStart, parallel)
+`, step.Name, step.Script, step.IsStart, step.Parallel)
 	if err != nil {
 		return 0, err
 	}
@@ -154,15 +156,6 @@ func (d Database) GetStartingStep() (*Step, error) {
 	return &step, nil
 }
 
-func (d Database) UpdateStep(id int64, name, script string, isStart bool, parallel *int) error {
-	_, err := d.db.Exec(`
-UPDATE step 
-SET name = ?, script = ?, is_start = ?, parallel = ?
-WHERE id = ?
-`, name, script, isStart, parallel, id)
-	return err
-}
-
 func (d Database) DeleteStep(id int64) error {
 	_, err := d.db.Exec("DELETE FROM step WHERE id = ?", id)
 	return err
@@ -215,11 +208,11 @@ func (d Database) ListSteps() chan Step {
 
 // Task CRUD operations
 
-func (d Database) CreateTask(objectHash string, stepID *int64, inputTaskID *int64) (int64, error) {
+func (d Database) CreateTask(task Task) (int64, error) {
 	res, err := d.db.Exec(`
-INSERT OR IGNORE INTO task (object_hash, step_id, input_task_id, processed)
-VALUES (?, ?, ?, 0);
-`, objectHash, stepID, inputTaskID)
+INSERT OR IGNORE INTO task (object_hash, step_id, input_task_id, processed, error)
+VALUES (?, ?, ?, ?, ?);
+`, task.ObjectHash, task.StepID, task.InputTaskID, task.Processed, task.Error)
 	if err != nil {
 		return 0, err
 	}
@@ -235,7 +228,7 @@ VALUES (?, ?, ?, 0);
 		err := d.db.QueryRow(`
 			SELECT id FROM task 
 			WHERE object_hash = ? AND step_id = ? AND (input_task_id = ? OR (input_task_id IS NULL AND ? IS NULL))
-		`, objectHash, stepID, inputTaskID, inputTaskID).Scan(&existingID)
+		`, task.ObjectHash, task.StepID, task.InputTaskID, task.InputTaskID).Scan(&existingID)
 		if err != nil {
 			return 0, fmt.Errorf("failed to find existing task after ignored insert: %w", err)
 		}
@@ -247,8 +240,8 @@ VALUES (?, ?, ?, 0);
 
 func (d Database) GetTask(id int64) (*Task, error) {
 	var t Task
-	err := d.db.QueryRow("SELECT id, object_hash, step_id, input_task_id, processed FROM task WHERE id = ?", id).Scan(
-		&t.ID, &t.ObjectHash, &t.StepID, &t.InputTaskID, &t.Processed,
+	err := d.db.QueryRow("SELECT id, object_hash, step_id, input_task_id, processed, error FROM task WHERE id = ?", id).Scan(
+		&t.ID, &t.ObjectHash, &t.StepID, &t.InputTaskID, &t.Processed, &t.Error,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -265,12 +258,12 @@ func (d Database) TaskExists(id int64) (bool, error) {
 	return exists, err
 }
 
-func (d Database) UpdateTask(id int64, objectHash string, stepID *int64, inputTaskID *int64, processed bool) error {
+func (d Database) UpdateTaskStatus(id int64, processed bool, errorMsg *string) error {
 	_, err := d.db.Exec(`
 UPDATE task 
-SET object_hash = ?, step_id = ?, input_task_id = ?, processed = ?
+SET processed = ?, error = ?
 WHERE id = ?
-`, objectHash, stepID, inputTaskID, processed, id)
+`, processed, errorMsg, id)
 	return err
 }
 
@@ -285,7 +278,7 @@ func (d Database) ListTasks() chan Task {
 	go func() {
 		defer close(taskChan)
 
-		rows, err := d.db.Query("SELECT id, object_hash, step_id, input_task_id, processed FROM task ORDER BY id")
+		rows, err := d.db.Query("SELECT id, object_hash, step_id, input_task_id, processed, error FROM task ORDER BY id")
 		if err != nil {
 			panic(err)
 		}
@@ -293,7 +286,7 @@ func (d Database) ListTasks() chan Task {
 
 		for rows.Next() {
 			var t Task
-			if err := rows.Scan(&t.ID, &t.ObjectHash, &t.StepID, &t.InputTaskID, &t.Processed); err != nil {
+			if err := rows.Scan(&t.ID, &t.ObjectHash, &t.StepID, &t.InputTaskID, &t.Processed, &t.Error); err != nil {
 				panic(err)
 			}
 			taskChan <- t
@@ -316,7 +309,7 @@ func (d Database) GetTasksForStep(stepID int64) chan Task {
 		defer close(taskChan)
 
 		rows, err := d.db.Query(`
-			SELECT id, object_hash, step_id, input_task_id, processed 
+			SELECT id, object_hash, step_id, input_task_id, processed, error 
 			FROM task 
 			WHERE step_id = ?
 			ORDER BY id
@@ -328,7 +321,7 @@ func (d Database) GetTasksForStep(stepID int64) chan Task {
 
 		for rows.Next() {
 			var t Task
-			if err := rows.Scan(&t.ID, &t.ObjectHash, &t.StepID, &t.InputTaskID, &t.Processed); err != nil {
+			if err := rows.Scan(&t.ID, &t.ObjectHash, &t.StepID, &t.InputTaskID, &t.Processed, &t.Error); err != nil {
 				panic(err)
 			}
 			taskChan <- t
@@ -342,6 +335,20 @@ func (d Database) GetTasksForStep(stepID int64) chan Task {
 	return taskChan
 }
 
+func (d Database) CountUnprocessedTasks() (int64, error) {
+	row := d.db.QueryRow("SELECT COUNT(*) FROM task WHERE processed = 0")
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+func (d Database) CountTasksForStep(stepID int64) (int64, error) {
+	row := d.db.QueryRow("SELECT COUNT(*) FROM task WHERE step_id = ?", stepID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 func (d Database) GetUnprocessedTasks(stepID int64) chan Task {
 	taskChan := make(chan Task)
 
@@ -349,27 +356,30 @@ func (d Database) GetUnprocessedTasks(stepID int64) chan Task {
 		defer close(taskChan)
 
 		rows, err := d.db.Query(`
-			SELECT id, object_hash, step_id, input_task_id, processed 
+			SELECT id, object_hash, step_id, input_task_id, processed, error 
 			FROM task 
 			WHERE step_id = ? 
+			  AND processed = 0
 			  AND id NOT IN (SELECT DISTINCT input_task_id FROM task WHERE input_task_id IS NOT NULL)
 			ORDER BY id
 		`, stepID)
 		if err != nil {
-			panic(err)
+			dbLogger.Printf("Error querying unprocessed tasks for step %d: %v", stepID, err)
+			return
 		}
 		defer rows.Close()
 
 		for rows.Next() {
 			var t Task
-			if err := rows.Scan(&t.ID, &t.ObjectHash, &t.StepID, &t.InputTaskID, &t.Processed); err != nil {
-				panic(err)
+			if err := rows.Scan(&t.ID, &t.ObjectHash, &t.StepID, &t.InputTaskID, &t.Processed, &t.Error); err != nil {
+				dbLogger.Printf("Error scanning task for step %d: %v", stepID, err)
+				return
 			}
 			taskChan <- t
 		}
 
 		if err := rows.Err(); err != nil {
-			panic(err)
+			dbLogger.Printf("Error iterating tasks for step %d: %v", stepID, err)
 		}
 	}()
 
@@ -383,7 +393,7 @@ func (d Database) GetNextTasks(taskID int64) chan Task {
 		defer close(taskChan)
 
 		rows, err := d.db.Query(`
-			SELECT id, object_hash, step_id, input_task_id, processed 
+			SELECT id, object_hash, step_id, input_task_id, processed, error 
 			FROM task 
 			WHERE input_task_id = ?
 			ORDER BY id
@@ -395,7 +405,7 @@ func (d Database) GetNextTasks(taskID int64) chan Task {
 
 		for rows.Next() {
 			var t Task
-			if err := rows.Scan(&t.ID, &t.ObjectHash, &t.StepID, &t.InputTaskID, &t.Processed); err != nil {
+			if err := rows.Scan(&t.ID, &t.ObjectHash, &t.StepID, &t.InputTaskID, &t.Processed, &t.Error); err != nil {
 				panic(err)
 			}
 			taskChan <- t
