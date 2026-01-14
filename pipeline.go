@@ -35,13 +35,10 @@ func (p *Pipeline) Execute(startStepName string, maxParallel int) int64 {
 		stepsIndex[s.ID] = s
 	}
 
-	recycle := make(chan Task, 10000)
-	var recycleWg sync.WaitGroup
-
 	unprocessedTasks := p.IterateUnprocessed()
 	seedTasks := p.Seed()
 
-	inputTasks := chans.Merge(recycle, unprocessedTasks, seedTasks)
+	inputTasks := chans.Merge(unprocessedTasks, seedTasks)
 
 	type ScheduledTask struct {
 		task Task
@@ -50,10 +47,8 @@ func (p *Pipeline) Execute(startStepName string, maxParallel int) int64 {
 
 	scheduledTasks := make(chan ScheduledTask)
 
-	recycleWg.Add(1)
 	go func() {
 		defer close(scheduledTasks)
-		defer recycleWg.Done()
 		defer pipelineLogger.Println("Scheduling goroutine quitting")
 
 		resourceMap := make(map[int64]int)
@@ -88,18 +83,13 @@ func (p *Pipeline) Execute(startStepName string, maxParallel int) int64 {
 					task: uTask,
 					done: doneChan,
 				}
-			} else {
-				recycle <- uTask
 			}
 		}
 	}()
 
-	type SaveTask Task
-	saveChan := make(chan SaveTask)
 	updateChan := make(chan Task)
 
 	go func() {
-		defer close(saveChan)
 		defer close(updateChan)
 
 		workers.Parallel0(scheduledTasks, maxParallel, func(inTask ScheduledTask) {
@@ -110,15 +100,9 @@ func (p *Pipeline) Execute(startStepName string, maxParallel int) int64 {
 			numberOfExecutions++
 
 			for nextTask := range nextTasks {
-				saveChan <- SaveTask(nextTask)
 				updateChan <- nextTask
 			}
 		})
-	}()
-
-	go func() {
-		recycleWg.Wait()
-		close(recycle)
 	}()
 
 	for task := range updateChan {

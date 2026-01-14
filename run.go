@@ -26,18 +26,18 @@ func run(manifest Manifest, database Database, parallel int, startStepName strin
 
 	for _, step := range manifest.Steps {
 		database.CreateStep(Step{
-			Name: step.Name,
-			Script: step.Script,
-			IsStart: step.Start,
+			Name:     step.Name,
+			Script:   step.Script,
+			IsStart:  step.Start,
 			Parallel: step.Parallel,
 		})
 	}
 
 	runLogger.Println("Stubbed done task")
 	database.CreateStep(Step{
-		Name: "done", 
-		Script: "true",
-		IsStart: false,
+		Name:     "done",
+		Script:   "true",
+		IsStart:  false,
 		Parallel: nil,
 	})
 
