@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"sync"
 
 	"github.com/danhab99/idk/chans"
@@ -36,9 +37,22 @@ func (p *Pipeline) Execute(startStepName string, maxParallel int) int64 {
 	}
 
 	unprocessedTasks := p.IterateUnprocessed()
-	seedTasks := p.Seed()
-
-	inputTasks := chans.Merge(unprocessedTasks, seedTasks)
+	
+	// Check if we have any unprocessed tasks
+	unprocessedCount, err := db.CountUnprocessedTasks()
+	if err != nil {
+		panic(err)
+	}
+	
+	var inputTasks chan Task
+	if unprocessedCount == 0 {
+		// No unprocessed tasks, need to seed
+		seedTasks := p.Seed()
+		inputTasks = seedTasks
+	} else {
+		// Have unprocessed tasks, don't seed
+		inputTasks = unprocessedTasks
+	}
 
 	type ScheduledTask struct {
 		task Task
@@ -71,7 +85,7 @@ func (p *Pipeline) Execute(startStepName string, maxParallel int) int64 {
 						resourceMap[*uTask.StepID]--
 					},
 				}
-			} 
+			}
 		}
 	}()
 
@@ -84,17 +98,20 @@ func (p *Pipeline) Execute(startStepName string, maxParallel int) int64 {
 			task := inTask.task
 
 			pipelineLogger.Printf("Executing taskID=%d\n", inTask.task.ID)
-			nextTasks := p.ExecuteTask(task)
-			numberOfExecutions++
+			if !task.Processed {
+				nextTasks := p.ExecuteTask(task)
+				numberOfExecutions++
 
-			for nextTask := range nextTasks {
-				updateChan <- nextTask
+				for nextTask := range nextTasks {
+					updateChan <- nextTask
+				}
 			}
 		})
 	}()
 
 	for task := range updateChan {
 		pipelineLogger.Printf("Task %d is complete\n", task.ID)
+		// runtime.Breakpoint()
 		db.UpdateTaskStatus(task.ID, true, nil)
 	}
 
@@ -211,6 +228,11 @@ func (p Pipeline) ExecuteTask(t Task) chan Task {
 
 	defer workerWg.Wait()
 
+	err = db.UpdateTaskStatus(t.ID, true, nil)
+	if err != nil {
+		panic(err)
+	}
+
 	go func() {
 		defer close(outputTasks)
 		defer workerWg.Done()
@@ -255,16 +277,21 @@ func (p Pipeline) ExecuteTask(t Task) chan Task {
 				inputTaskID = &t.ID
 			}
 
-			t := Task{
+			pTask := Task{
 				ObjectHash:  hash,
 				InputTaskID: inputTaskID,
 				Processed:   isCompleted,
 			}
+
 			if nextStep != nil {
-				t.StepID = &nextStep.ID
+				pTask.StepID = &nextStep.ID
+			}
+			t, err := db.CreateAndGetTask(pTask)
+			if err != nil {
+				panic(err)
 			}
 
-			outputTasks <- t
+			outputTasks <- *t
 
 			objectPath := db.GetObjectPath(hash)
 			_, err = copyFileWithSHA256(filePath, objectPath)
@@ -312,10 +339,59 @@ func (p Pipeline) Seed() chan Task {
 	if err != nil {
 		panic(err)
 	}
-
-	t := Task{
-		StepID: &startStep.ID,
+	if startStep == nil {
+		panic("start step cannot be nil")
 	}
 
-	return p.ExecuteTask(t)
+	out := make(chan Task)
+
+	go func() {
+		defer close(out)
+
+		sent := false
+		realTaskCount := 0
+		unprocessedTaskCount := 0
+
+		var wg sync.WaitGroup
+
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			for t := range db.GetUnprocessedTasks(startStep.ID) {
+				out <- t
+				sent = true
+				unprocessedTaskCount++
+			}
+		}()
+
+		go func() {
+			defer wg.Done()
+			// are there no tasks at all to do ??
+			for range db.GetTasksForStep(startStep.ID) {
+				realTaskCount++
+			}
+		}()
+
+		wg.Wait()
+
+		if !sent && realTaskCount == unprocessedTaskCount {
+			prestartTask := Task{
+				StepID: &startStep.ID,
+			}
+
+			startTaskId, err := db.CreateTask(prestartTask)
+			if err != nil {
+				panic(err)
+			}
+
+			startTask, err := db.GetTask(startTaskId)
+
+			for t := range p.ExecuteTask(*startTask) {
+				out <- t
+			}
+		}
+	}()
+
+	return out
 }
