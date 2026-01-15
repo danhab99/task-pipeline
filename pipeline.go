@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"os"
 	"os/exec"
 	"runtime"
@@ -311,12 +310,6 @@ func (p Pipeline) IterateUnprocessed() chan Task {
 	}
 
 	return chans.Merge(tasksChans...)
-}
-
-func infiniteBuffer[T any](inChan chan T) chan T {
-	outChan := make(chan T)
-	chans.GiantChan(inChan, outChan, math.MaxUint64)
-	return outChan
 }
 
 func (p Pipeline) Seed() chan Task {
