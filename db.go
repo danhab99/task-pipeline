@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS step (
   name     TEXT UNIQUE NOT NULL,
   script   TEXT NOT NULL,
   is_start INTEGER DEFAULT 0,
-  parallel INTEGER
+  parallel INTEGER,
+  processed INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task (
@@ -45,11 +46,12 @@ type Database struct {
 }
 
 type Step struct {
-	ID       int64
-	Name     string
-	Script   string
-	IsStart  bool
-	Parallel *int
+	ID        int64
+	Name      string
+	Script    string
+	IsStart   bool
+	Parallel  *int
+	Processed bool
 }
 
 type Task struct {
@@ -59,6 +61,31 @@ type Task struct {
 	InputTaskID *int64
 	Processed   bool
 	Error       *string
+}
+
+func (t Task) String() string {
+	var s string
+	if t.StepID == nil {
+		s = "NIL"
+	} else {
+		s = fmt.Sprintf("%d", *t.StepID)
+	}
+
+	var i string
+	if t.InputTaskID == nil {
+		i = "NIL"
+	} else {
+		i = fmt.Sprintf("%d", *t.InputTaskID)
+	}
+
+	var e string 
+	if t.Error == nil {
+		e = "NIL"
+	} else {
+		e = *t.Error
+	}
+
+	return fmt.Sprintf("Task(id=%d object_hash=%s step_id=%s input_task_id=%s processed=%v error=%s)", t.ID, t.ObjectHash, s, i, t.Processed, e)
 }
 
 func NewDatabase(repo_path string) (Database, error) {
@@ -90,9 +117,9 @@ func NewDatabase(repo_path string) (Database, error) {
 
 func (d Database) CreateStep(step Step) (int64, error) {
 	res, err := d.db.Exec(`
-INSERT INTO step (name, script, is_start, parallel)
-VALUES (?, ?, ?, ?)
-`, step.Name, step.Script, step.IsStart, step.Parallel)
+INSERT INTO step (name, script, is_start, parallel, processed)
+VALUES (?, ?, ?, ?, ?)
+`, step.Name, step.Script, step.IsStart, step.Parallel, step.Processed)
 	if err != nil {
 		return 0, err
 	}
@@ -102,8 +129,8 @@ VALUES (?, ?, ?, ?)
 func (d Database) GetStep(id int64) (*Step, error) {
 	var step Step
 	var parallel sql.NullInt64
-	err := d.db.QueryRow("SELECT id, name, script, is_start, parallel FROM step WHERE id = ?", id).Scan(
-		&step.ID, &step.Name, &step.Script, &step.IsStart, &parallel,
+	err := d.db.QueryRow("SELECT id, name, script, is_start, parallel, processed FROM step WHERE id = ?", id).Scan(
+		&step.ID, &step.Name, &step.Script, &step.IsStart, &parallel, &step.Processed,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -121,8 +148,8 @@ func (d Database) GetStep(id int64) (*Step, error) {
 func (d Database) GetStepByName(name string) (*Step, error) {
 	var step Step
 	var parallel sql.NullInt64
-	err := d.db.QueryRow("SELECT id, name, script, is_start, parallel FROM step WHERE name = ?", name).Scan(
-		&step.ID, &step.Name, &step.Script, &step.IsStart, &parallel,
+	err := d.db.QueryRow("SELECT id, name, script, is_start, parallel, processed FROM step WHERE name = ?", name).Scan(
+		&step.ID, &step.Name, &step.Script, &step.IsStart, &parallel, &step.Processed,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -140,8 +167,8 @@ func (d Database) GetStepByName(name string) (*Step, error) {
 func (d Database) GetStartingStep() (*Step, error) {
 	var step Step
 	var parallel sql.NullInt64
-	err := d.db.QueryRow("SELECT id, name, script, is_start, parallel FROM step WHERE is_start = 1 LIMIT 1").Scan(
-		&step.ID, &step.Name, &step.Script, &step.IsStart, &parallel,
+	err := d.db.QueryRow("SELECT id, name, script, is_start, parallel, processed FROM step WHERE is_start = 1 LIMIT 1").Scan(
+		&step.ID, &step.Name, &step.Script, &step.IsStart, &parallel, &step.Processed,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -158,6 +185,15 @@ func (d Database) GetStartingStep() (*Step, error) {
 
 func (d Database) DeleteStep(id int64) error {
 	_, err := d.db.Exec("DELETE FROM step WHERE id = ?", id)
+	return err
+}
+
+func (d Database) UpdateStepStatus(id int64, processed bool) error {
+	_, err := d.db.Exec(`
+UPDATE step 
+SET processed = ?
+WHERE id = ?
+`, processed, id)
 	return err
 }
 
@@ -179,7 +215,7 @@ func (d Database) ListSteps() chan Step {
 	go func() {
 		defer close(stepChan)
 
-		rows, err := d.db.Query("SELECT id, name, script, is_start, parallel FROM step ORDER BY id")
+		rows, err := d.db.Query("SELECT id, name, script, is_start, parallel, processed FROM step ORDER BY id")
 		if err != nil {
 			panic(err)
 		}
@@ -188,7 +224,7 @@ func (d Database) ListSteps() chan Step {
 		for rows.Next() {
 			var step Step
 			var parallel sql.NullInt64
-			if err := rows.Scan(&step.ID, &step.Name, &step.Script, &step.IsStart, &parallel); err != nil {
+			if err := rows.Scan(&step.ID, &step.Name, &step.Script, &step.IsStart, &parallel, &step.Processed); err != nil {
 				panic(err)
 			}
 			if parallel.Valid {
@@ -347,6 +383,70 @@ func (d Database) CountTasksForStep(stepID int64) (int64, error) {
 	var count int64
 	err := row.Scan(&count)
 	return count, err
+}
+
+func (d Database) CountUnprocessedTasksForStep(stepID int64) (int64, error) {
+	row := d.db.QueryRow("SELECT COUNT(*) FROM task WHERE step_id = ? AND processed = 0", stepID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+func (d Database) IsStepComplete(stepID int64) (bool, error) {
+	count, err := d.CountUnprocessedTasksForStep(stepID)
+	if err != nil {
+		return false, err
+	}
+	return count == 0, nil
+}
+
+func (d Database) CheckAndMarkStepComplete(stepID int64) (bool, error) {
+	isComplete, err := d.IsStepComplete(stepID)
+	if err != nil {
+		return false, err
+	}
+
+	if isComplete {
+		step, err := d.GetStep(stepID)
+		if err != nil {
+			return false, err
+		}
+
+		// Only mark as processed if it wasn't already
+		if step != nil && !step.Processed {
+			err = d.UpdateStepStatus(stepID, true)
+			if err != nil {
+				return false, err
+			}
+			dbLogger.Printf("Step %d (%s) marked as complete", stepID, step.Name)
+		}
+	}
+
+	return isComplete, nil
+}
+
+func (d Database) AreAllStepsComplete() (bool, error) {
+	var incompleteCount int64
+	err := d.db.QueryRow("SELECT COUNT(*) FROM step WHERE processed = 0").Scan(&incompleteCount)
+	if err != nil {
+		return false, err
+	}
+	return incompleteCount == 0, nil
+}
+
+func (d Database) GetPipelineStatus() (complete bool, totalTasks int64, processedTasks int64, err error) {
+	err = d.db.QueryRow("SELECT COUNT(*) FROM task").Scan(&totalTasks)
+	if err != nil {
+		return false, 0, 0, err
+	}
+
+	err = d.db.QueryRow("SELECT COUNT(*) FROM task WHERE processed = 1").Scan(&processedTasks)
+	if err != nil {
+		return false, 0, 0, err
+	}
+
+	complete = totalTasks > 0 && totalTasks == processedTasks
+	return complete, totalTasks, processedTasks, nil
 }
 
 func (d Database) GetUnprocessedTasks(stepID int64) chan Task {
