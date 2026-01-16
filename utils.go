@@ -68,3 +68,9 @@ func hashFileSHA256(path string) (string, error) {
 
 	return fmt.Sprintf("%x", hasher.Sum(nil)), nil
 }
+
+func hashStringSHA256(s string) string {
+	hasher := sha256.New()
+	hasher.Write([]byte(s))
+	return fmt.Sprintf("%x", hasher.Sum(nil))
+}

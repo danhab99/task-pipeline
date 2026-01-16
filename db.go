@@ -258,6 +258,21 @@ WHERE id = ?
 	return err
 }
 
+func (d Database) UpdateStepScriptHash(id int64, scriptHash string) error {
+	dbLogger.Printf("UpdateStepScriptHash: id=%d, hash=%s", id, scriptHash)
+	_, err := d.db.Exec(`
+UPDATE step 
+SET script_hash = ?
+WHERE id = ?
+`, scriptHash, id)
+	if err != nil {
+		dbLogger.Printf("UpdateStepScriptHash: error=%v", err)
+	} else {
+		dbLogger.Printf("UpdateStepScriptHash: success")
+	}
+	return err
+}
+
 func (d Database) CountSteps() (int64, error) {
 	dbLogger.Printf("CountSteps")
 	var count int64
@@ -512,6 +527,17 @@ func (d Database) CountUnprocessedTasksForStep(stepID int64) (int64, error) {
 	return count, err
 }
 
+func (d Database) MarkAllTasksUnprocessedForStep(stepID int64) error {
+	dbLogger.Printf("MarkAllTasksUnprocessedForStep: step_id=%d", stepID)
+	result, err := d.db.Exec("UPDATE task SET processed = 0 WHERE step_id = ?", stepID)
+	if err != nil {
+		return err
+	}
+	rowsAffected, _ := result.RowsAffected()
+	dbLogger.Printf("MarkAllTasksUnprocessedForStep: step_id=%d, updated %d tasks", stepID, rowsAffected)
+	return nil
+}
+
 func (d Database) IsStepComplete(stepID int64) (bool, error) {
 	dbLogger.Printf("IsStepComplete: step_id=%d", stepID)
 	count, err := d.CountUnprocessedTasksForStep(stepID)
@@ -702,4 +728,32 @@ func (d *Database) CreateAndGetTask(t Task) (*Task, error) {
 		dbLogger.Printf("CreateAndGetTask: returned task id=%d", task.ID)
 	}
 	return task, err
+}
+
+func (db *Database) RegisterStep(name, script string, isStart bool, parallel *int) {
+	existingStartStep, err := db.GetStepByName(name)
+	if err != nil {
+		panic(err)
+	}
+
+	scriptHash := hashStringSHA256(script)
+
+	if existingStartStep == nil {
+		db.CreateStep(Step{
+			Name:       name,
+			ScriptHash: scriptHash,
+			IsStart:    isStart,
+			Parallel:   parallel,
+		})
+	} else if existingStartStep.ScriptHash == hashStringSHA256(script) {
+		err := db.UpdateStepScriptHash(existingStartStep.ID, scriptHash)
+		if err != nil {
+			panic(err)
+		}
+
+		err = db.MarkAllTasksUnprocessedForStep(existingStartStep.ID)
+		if err != nil {
+			panic(err)
+		}
+	}
 }
