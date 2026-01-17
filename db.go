@@ -127,11 +127,15 @@ func (d Database) CreateStep(step Step) (int64, error) {
 
 	if existing != nil {
 		// Step exists, update it and return existing ID
+		isCurrent := 1
+		if !step.IsCurrent {
+			isCurrent = 0
+		}
 		_, err = d.db.Exec(`
 UPDATE step 
-SET script = ?, is_start = ?, parallel = ?, processed = ?
+SET script = ?, is_start = ?, parallel = ?, processed = ?, previous_step_id = ?, is_current = ?
 WHERE id = ?
-`, step.Script, step.IsStart, step.Parallel, step.Processed, existing.ID)
+`, step.Script, step.IsStart, step.Parallel, step.Processed, step.PreviousStepID, isCurrent, existing.ID)
 		if err != nil {
 			return 0, err
 		}
@@ -139,11 +143,16 @@ WHERE id = ?
 		return existing.ID, nil
 	}
 
-	// Step doesn't exist, create it
+	// Step doesn't exist, create it - default is_current to 1 if not explicitly set to false
+	isCurrent := 1
+	if step.IsCurrent == false && step.PreviousStepID != nil {
+		// Only set to 0 if explicitly false AND has a previous step (i.e., is a historical version)
+		isCurrent = 0
+	}
 	res, err := d.db.Exec(`
-INSERT INTO step (name, script, is_start, parallel, processed)
-VALUES (?, ?, ?, ?, ?)
-`, step.Name, step.Script, step.IsStart, step.Parallel, step.Processed)
+INSERT INTO step (name, script, is_start, parallel, processed, previous_step_id, is_current)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+`, step.Name, step.Script, step.IsStart, step.Parallel, step.Processed, step.PreviousStepID, isCurrent)
 	if err != nil {
 		return 0, err
 	}
@@ -155,10 +164,10 @@ VALUES (?, ?, ?, ?, ?)
 func (d Database) GetStep(id int64) (*Step, error) {
 	dbLogger.Printf("GetStep: id=%d", id)
 	var step Step
-	var parallel sql.NullInt64
-	var isStart, processed int
-	err := d.db.QueryRow("SELECT id, name, script, is_start, parallel, processed FROM step WHERE id = ?", id).Scan(
-		&step.ID, &step.Name, &step.Script, &isStart, &parallel, &processed,
+	var parallel, previousStepID sql.NullInt64
+	var isStart, processed, isCurrent int
+	err := d.db.QueryRow("SELECT id, name, script, is_start, parallel, processed, previous_step_id, is_current FROM step WHERE id = ?", id).Scan(
+		&step.ID, &step.Name, &step.Script, &isStart, &parallel, &processed, &previousStepID, &isCurrent,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -169,9 +178,14 @@ func (d Database) GetStep(id int64) (*Step, error) {
 	}
 	step.IsStart = isStart != 0
 	step.Processed = processed != 0
+	step.IsCurrent = isCurrent != 0
 	if parallel.Valid {
 		val := int(parallel.Int64)
 		step.Parallel = &val
+	}
+	if previousStepID.Valid {
+		val := previousStepID.Int64
+		step.PreviousStepID = &val
 	}
 	dbLogger.Printf("GetStep: found name=%s", step.Name)
 	return &step, nil
@@ -180,10 +194,10 @@ func (d Database) GetStep(id int64) (*Step, error) {
 func (d Database) GetStepByName(name string) (*Step, error) {
 	dbLogger.Printf("GetStepByName: name=%s", name)
 	var step Step
-	var parallel sql.NullInt64
-	var isStart, processed int
-	err := d.db.QueryRow("SELECT id, name, script, is_start, parallel, processed FROM step WHERE name = ?", name).Scan(
-		&step.ID, &step.Name, &step.Script, &isStart, &parallel, &processed,
+	var parallel, previousStepID sql.NullInt64
+	var isStart, processed, isCurrent int
+	err := d.db.QueryRow("SELECT id, name, script, is_start, parallel, processed, previous_step_id, is_current FROM step WHERE name = ? AND is_current = 1", name).Scan(
+		&step.ID, &step.Name, &step.Script, &isStart, &parallel, &processed, &previousStepID, &isCurrent,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -194,9 +208,14 @@ func (d Database) GetStepByName(name string) (*Step, error) {
 	}
 	step.IsStart = isStart != 0
 	step.Processed = processed != 0
+	step.IsCurrent = isCurrent != 0
 	if parallel.Valid {
 		val := int(parallel.Int64)
 		step.Parallel = &val
+	}
+	if previousStepID.Valid {
+		val := previousStepID.Int64
+		step.PreviousStepID = &val
 	}
 	dbLogger.Printf("GetStepByName: found id=%d", step.ID)
 	return &step, nil
@@ -205,10 +224,10 @@ func (d Database) GetStepByName(name string) (*Step, error) {
 func (d Database) GetStartingStep() (*Step, error) {
 	dbLogger.Printf("GetStartingStep")
 	var step Step
-	var parallel sql.NullInt64
-	var isStart, processed int
-	err := d.db.QueryRow("SELECT id, name, script, is_start, parallel, processed FROM step WHERE is_start = 1 LIMIT 1").Scan(
-		&step.ID, &step.Name, &step.Script, &isStart, &parallel, &processed,
+	var parallel, previousStepID sql.NullInt64
+	var isStart, processed, isCurrent int
+	err := d.db.QueryRow("SELECT id, name, script, is_start, parallel, processed, previous_step_id, is_current FROM step WHERE is_start = 1 AND is_current = 1 LIMIT 1").Scan(
+		&step.ID, &step.Name, &step.Script, &isStart, &parallel, &processed, &previousStepID, &isCurrent,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -219,9 +238,14 @@ func (d Database) GetStartingStep() (*Step, error) {
 	}
 	step.IsStart = isStart != 0
 	step.Processed = processed != 0
+	step.IsCurrent = isCurrent != 0
 	if parallel.Valid {
 		val := int(parallel.Int64)
 		step.Parallel = &val
+	}
+	if previousStepID.Valid {
+		val := previousStepID.Int64
+		step.PreviousStepID = &val
 	}
 	dbLogger.Printf("GetStartingStep: found id=%d, name=%s", step.ID, step.Name)
 	return &step, nil
@@ -297,7 +321,7 @@ func (d Database) ListSteps() chan Step {
 		defer close(stepChan)
 		count := 0
 
-		rows, err := d.db.Query("SELECT id, name, script, is_start, parallel, processed FROM step ORDER BY id")
+		rows, err := d.db.Query("SELECT id, name, script, is_start, parallel, processed, previous_step_id, is_current FROM step WHERE is_current = 1 ORDER BY id")
 		if err != nil {
 			panic(err)
 		}
@@ -305,16 +329,21 @@ func (d Database) ListSteps() chan Step {
 
 		for rows.Next() {
 			var step Step
-			var parallel sql.NullInt64
-			var isStart, processed int
-			if err := rows.Scan(&step.ID, &step.Name, &step.Script, &isStart, &parallel, &processed); err != nil {
+			var parallel, previousStepID sql.NullInt64
+			var isStart, processed, isCurrent int
+			if err := rows.Scan(&step.ID, &step.Name, &step.Script, &isStart, &parallel, &processed, &previousStepID, &isCurrent); err != nil {
 				panic(err)
 			}
 			step.IsStart = isStart != 0
 			step.Processed = processed != 0
+			step.IsCurrent = isCurrent != 0
 			if parallel.Valid {
 				val := int(parallel.Int64)
 				step.Parallel = &val
+			}
+			if previousStepID.Valid {
+				val := previousStepID.Int64
+				step.PreviousStepID = &val
 			}
 			stepChan <- step
 			count++
