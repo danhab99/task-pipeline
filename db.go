@@ -567,6 +567,18 @@ func (d Database) MarkAllTasksUnprocessedForStep(stepID int64) error {
 	return nil
 }
 
+func (d Database) DeleteAllTasksForStep(stepID int64) error {
+	dbLogger.Printf("DeleteAllTasksForStep: step_id=%d", stepID)
+	result, err := d.db.Exec("DELETE FROM task WHERE step_id = ?", stepID)
+	if err != nil {
+		dbLogger.Printf("DeleteAllTasksForStep: error=%v", err)
+		return err
+	}
+	rowsAffected, _ := result.RowsAffected()
+	dbLogger.Printf("DeleteAllTasksForStep: step_id=%d, deleted %d tasks", stepID, rowsAffected)
+	return nil
+}
+
 func (d Database) IsStepComplete(stepID int64) (bool, error) {
 	dbLogger.Printf("IsStepComplete: step_id=%d", stepID)
 	count, err := d.CountUnprocessedTasksForStep(stepID)
