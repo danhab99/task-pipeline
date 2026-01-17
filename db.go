@@ -262,7 +262,7 @@ func (d Database) UpdateStepScriptHash(id int64, scriptHash string) error {
 	dbLogger.Printf("UpdateStepScriptHash: id=%d, hash=%s", id, scriptHash)
 	_, err := d.db.Exec(`
 UPDATE step 
-SET script_hash = ?
+SET script = ?
 WHERE id = ?
 `, scriptHash, id)
 	if err != nil {
@@ -717,7 +717,6 @@ func (d Database) GetObjectPath(hash string) string {
 }
 
 func (d *Database) CreateAndGetTask(t Task) (*Task, error) {
-	dbLogger.Printf("CreateAndGetTask: object_hash=%s, step_id=%v, input_task_id=%v", t.ObjectHash, t.StepID, t.InputTaskID)
 	taskId, err := d.CreateTask(t)
 	if err != nil {
 		return nil, err
@@ -725,28 +724,40 @@ func (d *Database) CreateAndGetTask(t Task) (*Task, error) {
 
 	task, err := d.GetTask(taskId)
 	if err == nil && task != nil {
-		dbLogger.Printf("CreateAndGetTask: returned task id=%d", task.ID)
+		dbLogger.Printf("CreateAndGetTask: object_hash=%s, step_id=%v, input_task_id=%v -> returned task id=%d", t.ObjectHash, t.StepID, t.InputTaskID, task.ID)
 	}
 	return task, err
 }
 
-func (db *Database) RegisterStep(name, script string, isStart bool, parallel *int) {
+func (db *Database) RegisterStep(name, script string, isStart bool, parallel *int) *Step {
+	dbLogger.Printf("RegisterStep: name=%s, isStart=%v, parallel=%v\n", name, isStart, parallel)
 	existingStartStep, err := db.GetStepByName(name)
 	if err != nil {
 		panic(err)
 	}
 
-	scriptHash := hashStringSHA256(script)
-
 	if existingStartStep == nil {
-		db.CreateStep(Step{
-			Name:       name,
-			ScriptHash: scriptHash,
-			IsStart:    isStart,
-			Parallel:   parallel,
+		dbLogger.Printf("RegisterStep: step '%s' not found, creating new step\n", name)
+		stepId, err := db.CreateStep(Step{
+			Name:     name,
+			Script:   script,
+			IsStart:  isStart,
+			Parallel: parallel,
 		})
-	} else if existingStartStep.ScriptHash == hashStringSHA256(script) {
-		err := db.UpdateStepScriptHash(existingStartStep.ID, scriptHash)
+		if err != nil {
+			panic(err)
+		}
+
+		s, err := db.GetStep(stepId)
+		if err != nil {
+			panic(err)
+		}
+
+		dbLogger.Printf("RegisterStep: created new step '%s' with id=%d\n", name, s.ID)
+		return s
+	} else if existingStartStep.Script != script {
+		dbLogger.Printf("RegisterStep: step '%s' exists (id=%d) but script changed, updating\n", name, existingStartStep.ID)
+		err := db.UpdateStepScriptHash(existingStartStep.ID, script)
 		if err != nil {
 			panic(err)
 		}
@@ -755,5 +766,10 @@ func (db *Database) RegisterStep(name, script string, isStart bool, parallel *in
 		if err != nil {
 			panic(err)
 		}
+		dbLogger.Printf("RegisterStep: updated step '%s' script and marked tasks as unprocessed\n", name)
+	} else {
+		dbLogger.Printf("RegisterStep: step '%s' exists (id=%d) with same script, no changes needed\n", name, existingStartStep.ID)
 	}
+
+	return existingStartStep
 }

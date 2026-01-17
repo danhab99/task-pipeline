@@ -10,7 +10,6 @@ import (
 	"runtime"
 	"slices"
 	"sync"
-	"sync/atomic"
 
 	"github.com/danhab99/idk/chans"
 	"github.com/danhab99/idk/workers"
@@ -29,42 +28,81 @@ var pipelineLogger = log.New(os.Stderr, "[PIPELINE] ", log.Ldate|log.Ltime|log.L
 
 func (p *Pipeline) Execute(startStepName string, maxParallel int) int64 {
 	db := p.db
+	var numberOfExecutions int64
 
-	pipelineLogger.Println("Starting pipeline execution")
-	allSteps := <-chans.Accumulate(db.ListSteps())
-	pipelineLogger.Printf("Loaded %d steps from database", len(allSteps))
-
-	isStepAllowed := func(s Step) bool {
-		return slices.ContainsFunc(p.enabledSteps, func(enabledStep Step) bool {
-			return enabledStep.ID == s.ID
-		})
+	steps := <-chans.Accumulate(db.ListSteps())
+	stepsIndex := make(map[int64]Step)
+	for _, s := range steps {
+		stepsIndex[s.ID] = s
 	}
 
-	numberOfExecutions := int64(0)
+	unprocessedTasks := p.IterateUnprocessed()
+	seedTasks := p.Seed()
 
-	pipelineLogger.Println("Starting seed phase")
-	seedChan := p.Seed(startStepName)
-	for t := range seedChan {
-		pipelineLogger.Printf("Processing seed task %d", t.ID)
-		p.ExecuteTask(t)
-		numberOfExecutions++
+	inputTasks := chans.Merge(unprocessedTasks, seedTasks)
+
+	type ScheduledTask struct {
+		task Task
+		done func()
 	}
-	pipelineLogger.Println("Seed phase completed")
 
-	pipelineLogger.Println("Starting step execution phase")
-	for _, step := range allSteps {
-		if isStepAllowed(step) {
-			pipelineLogger.Printf("Executing step: %s (ID: %d)", step.Name, step.ID)
-			numberOfExecutions += p.ExecuteStep(step, maxParallel)
-			pipelineLogger.Printf("Completed step: %s", step.Name)
+	scheduledTasks := make(chan ScheduledTask)
+
+	go func() {
+		defer close(scheduledTasks)
+		defer pipelineLogger.Println("Scheduling goroutine quitting")
+
+		resourceMap := make(map[int64]int)
+
+		for uTask := range inputTasks {
+			resourceMap[uTask.ID]++
+			id := *uTask.StepID
+
+			pipelineLogger.Printf("Attempting to schedule task %#v\n", uTask)
+
+			if stepsIndex[id].Parallel == nil || resourceMap[id] <= *stepsIndex[id].Parallel {
+				pipelineLogger.Printf("Acquired lock for %d, %d\n", &uTask.StepID, uTask.ID)
+
+				scheduledTasks <- ScheduledTask{
+					task: uTask,
+					done: func() {
+						resourceMap[*uTask.StepID]--
+					},
+				}
+			}
 		}
+	}()
+
+	updateChan := make(chan Task)
+
+	go func() {
+		defer close(updateChan)
+
+		workers.Parallel0(scheduledTasks, maxParallel, func(inTask ScheduledTask) {
+			task := inTask.task
+
+			pipelineLogger.Printf("Executing taskID=%d\n", inTask.task.ID)
+			if !task.Processed {
+				nextTasks := p.ExecuteTask(task)
+				numberOfExecutions++
+
+				for nextTask := range nextTasks {
+					updateChan <- nextTask
+				}
+			}
+		})
+	}()
+
+	for task := range updateChan {
+		pipelineLogger.Printf("Task %d is complete\n", task.ID)
+		// runtime.Breakpoint()
+		db.UpdateTaskStatus(task.ID, true, nil)
 	}
-	pipelineLogger.Println("All steps completed")
 
 	return numberOfExecutions
 }
 
-func (p Pipeline) ExecuteTask(t Task) {
+func (p Pipeline) ExecuteTask(t Task) chan Task {
 	db := p.db
 
 	step, err := db.GetStep(*t.StepID)
@@ -163,13 +201,10 @@ func (p Pipeline) ExecuteTask(t Task) {
 		panic(err)
 	}
 
-	runLogger.Printf("  Found %d output entries to process", len(entries))
-
 	entriesChan := make(chan os.DirEntry)
 
 	go func() {
 		defer close(entriesChan)
-		defer runLogger.Printf("  Closed entriesChan for task %d", t.ID)
 		for _, entry := range entries {
 			entriesChan <- entry
 		}
@@ -178,117 +213,122 @@ func (p Pipeline) ExecuteTask(t Task) {
 	// Buffer size should accommodate all potential outputs to prevent blocking
 	outputTasks := make(chan Task, len(entries))
 
+	var workerWg sync.WaitGroup
+	workerWg.Add(1)
+
+	defer workerWg.Wait()
+
 	err = db.UpdateTaskStatus(t.ID, true, nil)
 	if err != nil {
 		panic(err)
 	}
 
-	runLogger.Printf("  Starting workers to process entries for task %d", t.ID)
-	workers.Parallel0(entriesChan, runtime.NumCPU(), func(entry os.DirEntry) {
-		if entry.IsDir() {
-			return
-		}
+	go func() {
+		defer close(outputTasks)
+		defer workerWg.Done()
 
-		filename := entry.Name()
-		stepName := extractStepName(filename)
-		filePath := fmt.Sprintf("%s/%s", outputDir, filename)
-
-		var isCompleted bool
-
-		nextStep, err := db.GetStepByName(stepName)
-		if err != nil {
-			panic(err)
-		}
-		if nextStep != nil {
-			isCompleted, err = db.IsTaskCompletedInNextStep(nextStep.ID, t.ID)
-			if err != nil {
-				panic(err)
-			}
-
-			if isCompleted {
-				fmt.Printf("This step is already completed %d\n", t.ID)
+		workers.Parallel0(entriesChan, runtime.NumCPU(), func(entry os.DirEntry) {
+			if entry.IsDir() {
 				return
 			}
-		}
 
-		runLogger.Printf("	Output: %s -> step '%s'", filename, stepName)
+			filename := entry.Name()
+			stepName := extractStepName(filename)
+			filePath := fmt.Sprintf("%s/%s", outputDir, filename)
 
-		hash, err := hashFileSHA256(filePath)
-		if err != nil {
-			panic(err)
-		}
+			var isCompleted bool
 
-		// Only set InputTaskID if current task has a valid DB ID
-		var inputTaskID *int64
-		if t.ID > 0 {
-			inputTaskID = &t.ID
-		}
-
-		pTask := Task{
-			ObjectHash:  hash,
-			InputTaskID: inputTaskID,
-			Processed:   isCompleted,
-		}
-
-		if nextStep != nil {
-			pTask.StepID = &nextStep.ID
-		}
-		t, err := db.CreateAndGetTask(pTask)
-		if err != nil {
-			panic(err)
-		}
-
-		outputTasks <- *t
-
-		objectPath := db.GetObjectPath(hash)
-		_, err = copyFileWithSHA256(filePath, objectPath)
-		if err != nil {
-			panic(err)
-		}
-
-		if !isCompleted {
-			_, err = db.CreateTask(Task{
-				ObjectHash:  hash,
-				StepID:      t.StepID,
-				InputTaskID: inputTaskID,
-			})
+			nextStep, err := db.GetStepByName(stepName)
 			if err != nil {
 				panic(err)
 			}
-		}
-	})
-	runLogger.Printf("  Workers finished for task %d", t.ID)
+			if nextStep != nil {
+				isCompleted, err = db.IsTaskCompletedInNextStep(nextStep.ID, t.ID)
+				if err != nil {
+					panic(err)
+				}
 
+				if isCompleted {
+					fmt.Printf("This step is already completed %d\n", t.ID)
+					return
+				}
+			}
+
+			runLogger.Printf("	Output: %s -> step '%s'", filename, stepName)
+
+			hash, err := hashFileSHA256(filePath)
+			if err != nil {
+				panic(err)
+			}
+
+			// Only set InputTaskID if current task has a valid DB ID
+			var inputTaskID *int64
+			if t.ID > 0 {
+				inputTaskID = &t.ID
+			}
+
+			pTask := Task{
+				ObjectHash:  hash,
+				InputTaskID: inputTaskID,
+				Processed:   isCompleted,
+			}
+
+			if nextStep != nil {
+				pTask.StepID = &nextStep.ID
+			}
+			t, err := db.CreateAndGetTask(pTask)
+			if err != nil {
+				panic(err)
+			}
+
+			outputTasks <- *t
+
+			objectPath := db.GetObjectPath(hash)
+			_, err = copyFileWithSHA256(filePath, objectPath)
+			if err != nil {
+				panic(err)
+			}
+
+			if !isCompleted {
+				_, err = db.CreateTask(Task{
+					ObjectHash:  hash,
+					StepID:      t.StepID,
+					InputTaskID: inputTaskID,
+				})
+				if err != nil {
+					panic(err)
+				}
+			}
+		})
+	}()
+
+	return outputTasks
 }
 
-// func (p Pipeline) IterateUnprocessed() chan Task {
-// 	db := p.db
-
-// 	var tasksChans []chan Task
-
-// 	for step := range db.ListSteps() {
-// 		if !slices.Contains(p.enabledSteps, step) {
-// 			continue
-// 		}
-
-// 		c := db.GetUnprocessedTasks(step.ID)
-// 		tasksChans = append(tasksChans, c)
-// 	}
-
-// 	return chans.Merge(tasksChans...)
-// }
-
-func (p Pipeline) Seed(startStepName string) chan Task {
+func (p Pipeline) IterateUnprocessed() chan Task {
 	db := p.db
 
-	var startStep *Step
-	var err error
+	var tasksChans []chan Task
 
-	if startStepName != "" {
-		startStep, err = db.GetStepByName(startStepName)
-	} else {
-		startStep, err = db.GetStartingStep()
+	for step := range db.ListSteps() {
+		if !slices.Contains(p.enabledSteps, step) {
+			continue
+		}
+		if step.IsStart {
+			continue
+		}
+
+		c := db.GetUnprocessedTasks(step.ID)
+		tasksChans = append(tasksChans, c)
 	}
+
+	return chans.Merge(tasksChans...)
+}
+
+func (p Pipeline) Seed() chan Task {
+	db := p.db
+
+	startStep, err := db.GetStartingStep()
 	if err != nil {
 		panic(err)
 	}
@@ -296,84 +336,36 @@ func (p Pipeline) Seed(startStepName string) chan Task {
 		panic("start step cannot be nil")
 	}
 
-	unprocessedCount, err := db.CountUnprocessedTasksForStep(startStep.ID)
-	if err != nil {
-		panic(err)
-	}
-	totalCount, err := db.CountTasksForStep(startStep.ID)
-	if err != nil {
-		panic(err)
-	}
+	out := make(chan Task)
 
-	pipelineLogger.Printf("Seed: step=%s, unprocessed=%d, total=%d", startStep.Name, unprocessedCount, totalCount)
+	go func() {
+		defer close(out)
 
-	out := make(chan Task, 1)
+		realTaskCount := 0
 
-	if unprocessedCount < totalCount {
-		pipelineLogger.Println("Seed: returning unprocessed tasks channel")
-		return db.GetUnprocessedTasks(startStep.ID)
-	} else if totalCount == 0 {
-		pipelineLogger.Println("Seed: creating new start task")
-		prestartTask := Task{
-			StepID: &startStep.ID,
+		for range db.GetTasksForStep(startStep.ID) {
+			realTaskCount++
 		}
 
-		startTaskId, err := db.CreateTask(prestartTask)
-		if err != nil {
-			panic(err)
-		}
-		startTask, err := db.GetTask(startTaskId)
+		// runtime.Breakpoint()
+		if realTaskCount == 0 {
+			// runtime.Breakpoint()
+			prestartTask := Task{
+				StepID: &startStep.ID,
+			}
 
-		out <- *startTask
-		close(out)
-		pipelineLogger.Println("Seed: start task sent and channel closed")
-	} else {
-		pipelineLogger.Println("Seed: no tasks to process, closing empty channel")
-		close(out)
-	}
+			startTaskId, err := db.CreateTask(prestartTask)
+			if err != nil {
+				panic(err)
+			}
+
+			startTask, err := db.GetTask(startTaskId)
+
+			for t := range p.ExecuteTask(*startTask) {
+				out <- t
+			}
+		}
+	}()
 
 	return out
-}
-
-func (p Pipeline) ExecuteStep(s Step, maxParallel int) int64 {
-	pipelineLogger.Printf("ExecuteStep: starting step '%s' (ID: %d)", s.Name, s.ID)
-	unprocessedTasks := p.db.GetUnprocessedTasks(s.ID)
-
-	parallel := maxParallel
-	if s.Parallel != nil {
-		parallel = *s.Parallel
-	}
-
-	pipelineLogger.Printf("ExecuteStep: using %d parallel workers for step '%s'", parallel, s.Name)
-
-	var count atomic.Int64
-	var wg sync.WaitGroup
-	wg.Add(parallel)
-
-	for i := range parallel {
-		go func(workerID int) {
-			defer wg.Done()
-			pipelineLogger.Printf("ExecuteStep: worker %d started for step '%s'", workerID, s.Name)
-			taskCount := 0
-			for task := range unprocessedTasks {
-				taskCount++
-				pipelineLogger.Printf("ExecuteStep: worker %d processing task %d (step '%s')", workerID, task.ID, s.Name)
-				p.ExecuteTask(task)
-
-				count.Add(1)
-
-				err := p.db.UpdateTaskStatus(task.ID, true, nil)
-				if err != nil {
-					panic(err)
-				}
-			}
-			pipelineLogger.Printf("ExecuteStep: worker %d finished, processed %d tasks for step '%s'", workerID, taskCount, s.Name)
-		}(i)
-	}
-
-	pipelineLogger.Printf("ExecuteStep: waiting for workers to complete for step '%s'", s.Name)
-	wg.Wait()
-	pipelineLogger.Printf("ExecuteStep: all workers completed for step '%s', total tasks: %d", s.Name, count.Load())
-
-	return count.Load()
 }
