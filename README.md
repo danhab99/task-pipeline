@@ -4,7 +4,71 @@ A Go-based task pipeline system that executes shell scripts in a managed workflo
 
 ## Quick Start
 
-### Build
+### Using Nix Flakes
+
+#### Build with Nix
+```bash
+nix build
+./result/bin/task-pipeline --help
+```
+
+#### Run directly
+```bash
+nix run . -- -manifest workflow.toml -db ./db -run
+```
+
+#### Add to your NixOS configuration
+
+Add this flake as an input to your NixOS configuration flake:
+
+```nix
+# In your NixOS flake.nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    task-pipeline = {
+      url = "path:/home/dan/Documents/go/src/task-pipeline";
+      # Or use a git repository:
+      # url = "github:yourusername/task-pipeline";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+
+  outputs = { self, nixpkgs, task-pipeline, ... }: {
+    nixosConfigurations.yourhostname = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ./configuration.nix
+        {
+          # Add to system packages
+          environment.systemPackages = [
+            task-pipeline.packages.x86_64-linux.default
+          ];
+        }
+      ];
+    };
+  };
+}
+```
+
+After rebuilding your system, `task-pipeline` will be available system-wide:
+```bash
+sudo nixos-rebuild switch --flake .#yourhostname
+task-pipeline --help
+```
+
+Alternatively, add it to your home-manager configuration:
+```nix
+# In home.nix or similar
+{ inputs, ... }:
+{
+  home.packages = [
+    inputs.task-pipeline.packages.x86_64-linux.default
+  ];
+}
+```
+
+### Build without Nix
 ```bash
 go build -o task-pipeline
 ```
@@ -61,6 +125,18 @@ Task Pipeline is a workflow automation tool that:
 - Supports task chaining and dependencies through step linking
 - Processes multiple task streams concurrently
 - Automatically detects and handles step versioning/tainted steps
+
+## Development
+
+### Nix Development Shell
+```bash
+# Enter development environment with all dependencies
+nix develop
+
+# Now you have go, gopls, delve, sqlite, etc.
+go build
+go test
+```
 
 ## Architecture
 
@@ -267,8 +343,3 @@ The program prints detailed logs during execution:
 - Output file generation
 - Task processing counts
 - Total steps processed
-
-## License
-
-[Add your license here]
-

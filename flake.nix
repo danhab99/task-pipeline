@@ -27,5 +27,28 @@
             CGO_CPPFLAGS = "-U_FORTIFY_SOURCE";
           };
         };
+
+        devShells.default = pkgs.mkShell {
+          buildInputs = with pkgs; [
+            go
+            gopls
+            delve
+            sqlite
+            sqlite-web
+          ];
+
+          shellHook = ''
+            echo "Task Pipeline development environment"
+            echo "Go version: $(go version)"
+            echo ""
+            echo "Available commands:"
+            echo "  go build      - Build the project"
+            echo "  go test       - Run tests"
+            echo "  dlv debug     - Debug with Delve"
+          '';
+
+          CGO_CFLAGS = "-U_FORTIFY_SOURCE";
+          CGO_CPPFLAGS = "-U_FORTIFY_SOURCE";
+        };
       });
 }
