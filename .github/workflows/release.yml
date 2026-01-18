@@ -1,0 +1,88 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v14
+
+      - name: Setup Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v8
+
+      - name: Build with Nix
+        run: nix build
+
+      - name: Get version from tag
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Copy binary
+        run: |
+          mkdir -p dist
+          cp result/bin/task-pipeline dist/task-pipeline-linux-x86_64
+          chmod +x dist/task-pipeline-linux-x86_64
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            dist/task-pipeline-linux-x86_64
+          body: |
+            ## Installation
+            
+            ### Download Binary
+            ```bash
+            wget https://github.com/${{ github.repository }}/releases/download/${{ steps.get_version.outputs.VERSION }}/task-pipeline-linux-x86_64
+            chmod +x task-pipeline-linux-x86_64
+            sudo mv task-pipeline-linux-x86_64 /usr/local/bin/task-pipeline
+            ```
+            
+            ### Using Nix Flakes
+            ```bash
+            nix run github:${{ github.repository }}/${{ steps.get_version.outputs.VERSION }} -- --help
+            ```
+            
+            Or add to your flake:
+            ```nix
+            {
+              inputs.task-pipeline.url = "github:${{ github.repository }}/${{ steps.get_version.outputs.VERSION }}";
+            }
+            ```
+          draft: false
+          prerelease: false
+
+  build-check:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v14
+
+      - name: Setup Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v8
+
+      - name: Check flake
+        run: nix flake check
+
+      - name: Build with Nix
+        run: nix build
+
+      - name: Test binary
+        run: ./result/bin/task-pipeline --help

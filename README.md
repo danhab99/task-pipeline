@@ -29,7 +29,7 @@ Add this flake as an input to your NixOS configuration flake:
     task-pipeline = {
       url = "path:/home/dan/Documents/go/src/task-pipeline";
       # Or use a git repository:
-      # url = "github:yourusername/task-pipeline";
+      # url = "github:danhab99/task-pipeline";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -136,6 +136,65 @@ nix develop
 # Now you have go, gopls, delve, sqlite, etc.
 go build
 go test
+```
+
+## Releases
+
+### CI/CD
+
+This project uses GitHub Actions for continuous integration and releases:
+
+- **CI Workflow** (`.github/workflows/ci.yml`): Runs on every push and pull request
+  - Checks flake validity
+  - Builds the project
+  - Tests the binary
+  - Runs basic pipeline tests
+
+- **Release Workflow** (`.github/workflows/release.yml`): Runs when you push a tag
+  - Builds release binaries using Nix
+  - Creates GitHub releases automatically
+  - Attaches binaries to the release
+
+### Creating a Release
+
+Releases are automated via GitHub Actions. To create a new release:
+
+1. **Tag the commit:**
+   ```bash
+   git tag v0.1.0
+   git push origin v0.1.0
+   ```
+
+2. **GitHub Actions will automatically:**
+   - Build the binary using Nix
+   - Create a GitHub release
+   - Attach the compiled binary (`task-pipeline-linux-x86_64`)
+   - Generate installation instructions
+
+3. **Users can then:**
+   - Download the binary directly from the release page
+   - Use `nix run github:danhab99/task-pipeline/v0.1.0`
+   - Reference the specific version in their flake inputs
+
+### Installing from a Release
+
+#### Binary Download
+```bash
+wget https://github.com/danhab99/task-pipeline/releases/download/v0.1.0/task-pipeline-linux-x86_64
+chmod +x task-pipeline-linux-x86_64
+sudo mv task-pipeline-linux-x86_64 /usr/local/bin/task-pipeline
+```
+
+#### Using Nix (specific version)
+```bash
+nix run github:danhab99/task-pipeline/v0.1.0 -- --help
+```
+
+#### In your flake (specific version)
+```nix
+{
+  inputs.task-pipeline.url = "github:danhab99/task-pipeline/v0.1.0";
+}
 ```
 
 ## Architecture

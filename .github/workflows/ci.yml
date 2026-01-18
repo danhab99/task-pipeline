@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v14
+
+      - name: Setup Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v8
+
+      - name: Check flake
+        run: nix flake check
+
+      - name: Build
+        run: nix build
+
+      - name: Test binary
+        run: |
+          ./result/bin/task-pipeline --help
+          echo "✓ Binary runs successfully"
+
+      - name: Test with example
+        run: |
+          # Create a simple test manifest
+          cat > test.toml << 'EOF'
+          [[step]]
+          name = "start"
+          start = true
+          script = '''
+          echo "test" > $OUTPUT_DIR/output
+          '''
+          EOF
+          
+          # Initialize and run pipeline
+          ./result/bin/task-pipeline -manifest test.toml -db ./test-db
+          echo "✓ Pipeline initialization successful"
