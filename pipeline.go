@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"os/exec"
 	"runtime"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/danhab99/idk/chans"
 	"github.com/danhab99/idk/workers"
+	"github.com/fatih/color"
 )
 
 type Pipeline struct {
@@ -24,7 +24,7 @@ func NewPipeline(d *Database, steps []Step) Pipeline {
 	return Pipeline{d, steps}
 }
 
-var pipelineLogger = log.New(os.Stderr, "[PIPELINE] ", log.Ldate|log.Ltime|log.Lmsgprefix)
+var pipelineLogger = NewColorLogger("[PIPELINE] ", color.New(color.FgCyan, color.Bold))
 
 func (p *Pipeline) Execute(startStepName string, maxParallel int) int64 {
 	db := p.db
@@ -39,6 +39,9 @@ func (p *Pipeline) Execute(startStepName string, maxParallel int) int64 {
 		// if slices.ContainsFunc(p.enabledSteps, func(e Step) bool {
 		// 	return s.Name == e.Name
 		// }) {
+		// 	continue
+		// }
+		// if s.Processed {
 		// 	continue
 		// }
 		stepsIndex[s.ID] = s
@@ -62,7 +65,8 @@ func (p Pipeline) ExecuteTask(t Task) {
 		panic(err)
 	}
 
-	runLogger.Printf("Processing task %d for step '%s'", t.ID, step.Name)
+	color.New(color.FgMagenta).Fprintf(os.Stderr, "  → ")
+	pipelineLogger.Printf("Task %d | Step: %s", t.ID, color.New(color.FgMagenta, color.Bold).Sprint(step.Name))
 
 	t.Processed = true
 
@@ -82,10 +86,10 @@ func (p Pipeline) ExecuteTask(t Task) {
 		if err != nil {
 			panic(err)
 		}
-		runLogger.Printf("  Input: %d bytes from %s", n, t.ObjectHash[:16]+"...")
+		pipelineLogger.Verbosef("    Input: %d bytes from %s", n, t.ObjectHash[:16]+"...")
 
 	} else {
-		runLogger.Println("  Input: (empty - start step)")
+		pipelineLogger.Verbosef("    Input: (empty - start step)")
 	}
 	inputFile.Close()
 
@@ -95,7 +99,7 @@ func (p Pipeline) ExecuteTask(t Task) {
 	}
 	defer os.RemoveAll(outputDir)
 
-	runLogger.Printf("  Executing script for step '%s'", step.Name)
+	pipelineLogger.Verbosef("    Executing: %s", step.Script)
 	cmd := exec.Command("sh", "-c", step.Script)
 	cmd.Env = append(os.Environ(),
 		fmt.Sprintf("INPUT_FILE=%s", inputFile.Name()),
@@ -112,11 +116,11 @@ func (p Pipeline) ExecuteTask(t Task) {
 	}
 
 	if err := cmd.Start(); err != nil {
-		runLogger.Printf("  Error starting script: %v", err)
+		pipelineLogger.Errorf("    Error starting script: %v", err)
 		panic(err)
 	}
 
-	scriptLogger := log.New(os.Stderr, fmt.Sprintf("[SCRIPT:%s] ", step.Name), log.Ldate|log.Ltime|log.Lmsgprefix)
+	scriptLogger := NewColorLogger(fmt.Sprintf("[SCRIPT:%s] ", step.Name), color.New(color.FgYellow))
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -124,7 +128,7 @@ func (p Pipeline) ExecuteTask(t Task) {
 		defer wg.Done()
 		scanner := bufio.NewScanner(stdoutPipe)
 		for scanner.Scan() {
-			scriptLogger.Println(scanner.Text())
+			scriptLogger.Verboseln(scanner.Text())
 		}
 	}()
 
@@ -132,14 +136,14 @@ func (p Pipeline) ExecuteTask(t Task) {
 		defer wg.Done()
 		scanner := bufio.NewScanner(stderrPipe)
 		for scanner.Scan() {
-			// scriptLogger.Printf("[stderr] %s", scanner.Text())
+			scriptLogger.Verbosef("[stderr] %s", scanner.Text())
 		}
 	}()
 
 	wg.Wait()
 
 	if err := cmd.Wait(); err != nil {
-		runLogger.Printf("  Error executing script: %v", err)
+		pipelineLogger.Errorf("    Error executing script: %v", err)
 	}
 
 	// runtime.Breakpoint()
@@ -189,12 +193,12 @@ func (p Pipeline) ExecuteTask(t Task) {
 			}
 
 			if isCompleted {
-				fmt.Printf("This step is already completed %d\n", t.ID)
+				pipelineLogger.Verbosef("    Task %d already completed in next step", t.ID)
 				return
 			}
 		}
 
-		runLogger.Printf("	Output: %s -> step '%s'", filename, stepName)
+		pipelineLogger.Verbosef("    Output: %s -> %s", filename, color.MagentaString(stepName))
 
 		hash, err := hashFileSHA256(filePath)
 		if err != nil {
@@ -292,22 +296,40 @@ func (p Pipeline) Seed() {
 func (p Pipeline) ExecuteStep(s Step) int64 {
 	db := p.db
 
-	pipelineLogger.Printf("Executing step id=%d name=%s\n", s.ID, s.Name)
+	color.New(color.FgCyan, color.Bold).Fprintf(os.Stderr, "\n▶ ")
+	pipelineLogger.Printf("Step: %s", color.New(color.FgMagenta, color.Bold).Sprint(s.Name))
 
 	numberOfExecutions := int64(0)
 	numberOfUnprocessedTasks := int64(0)
 
+	// Count unprocessed tasks first
 	for task := range db.GetUnprocessedTasks(s.ID) {
-		numberOfUnprocessedTasks++
+		if !task.Processed {
+			numberOfUnprocessedTasks++
+		}
+	}
+
+	if numberOfUnprocessedTasks == 0 {
+		pipelineLogger.Verbosef("  No unprocessed tasks for step '%s'", s.Name)
+		return 0
+	}
+
+	// Create progress bar
+	bar := NewProgressBar(numberOfUnprocessedTasks, fmt.Sprintf("  Processing %s", s.Name))
+
+	for task := range db.GetUnprocessedTasks(s.ID) {
 		if task.Processed {
 			continue
 		}
 
 		p.ExecuteTask(task)
 		numberOfExecutions++
+		bar.Add(1)
 	}
 
-	pipelineLogger.Printf("Step %s is complete count=%d/%d\n", s.Name, numberOfExecutions, numberOfUnprocessedTasks)
+	bar.Finish()
+
+	pipelineLogger.Successf("  Step '%s' complete: %d/%d tasks", s.Name, numberOfExecutions, numberOfUnprocessedTasks)
 	err := db.UpdateStepStatus(s.ID, true)
 	if err != nil {
 		panic(err)

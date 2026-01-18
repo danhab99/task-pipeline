@@ -114,6 +114,68 @@ cat $INPUT_FILE | sort > $OUTPUT_DIR/next
 
 # Specify starting step
 ./task-pipeline -manifest manifest.toml --db ./db -run -start process_name
+
+# Run with verbose output (see detailed task and script information)
+./task-pipeline -manifest manifest.toml --db ./db -run -verbose
+
+# Run with minimal output (for automation/CI)
+./task-pipeline -manifest manifest.toml --db ./db -run -quiet
+```
+
+## Visibility & Output
+
+The pipeline provides three output modes for different use cases:
+
+### Normal Mode (default)
+- Shows step execution progress
+- Real-time progress bars with task counts
+- Important operation status
+- Warnings and errors
+- Summary statistics at completion
+
+### Verbose Mode (`-verbose`)
+- Everything in normal mode PLUS:
+- Detailed task registration information
+- Input/output file paths and sizes
+- Script commands being executed
+- Script stdout/stderr in real-time
+- Database operation details
+
+### Quiet Mode (`-quiet`)
+- Minimal output
+- Only critical errors
+- No progress bars
+- Ideal for scripts and CI/CD pipelines
+
+### Color-Coded Output
+- 🟣 **Magenta/Purple**: Main program operations and step names
+- 🔵 **Blue**: Run controller
+- 🟢 **Cyan**: Pipeline execution
+- 🟡 **Yellow**: Script output
+- 🟢 **Green**: Success messages
+- 🔴 **Red**: Error messages
+
+### Output Examples
+
+**Execution progress:**
+```
+▶ Step: fetch
+  → Task 1 | Step: fetch
+    Processing fetch ████████████████░░░░  50% [5/10] [2.3 it/s]
+  Step 'fetch' complete: 10/10 tasks
+```
+
+**Summary statistics:**
+```
+╔══════════════════════════════════════════════════════════╗
+║ Pipeline Execution Summary                               ║
+╠══════════════════════════════════════════════════════════╣
+║ Total Tasks:         42                                  ║
+║ Total Rounds:        3                                   ║
+║ Parallel Workers:    8                                   ║
+║ Execution Time:      2.345s                              ║
+║ Avg Task Rate:       17.91 tasks/sec                     ║
+╚══════════════════════════════════════════════════════════╝
 ```
 
 ## Overview
@@ -243,6 +305,8 @@ task-pipeline -manifest <path-to-manifest.toml> -db <database-directory> [option
 - `-migrate-tainted`: Detect steps with changed scripts and migrate their tasks to new versions
 - `-parallel` (default: number of CPUs): Maximum concurrent tasks to execute
 - `-start`: Name of the step to start from (defaults to step with `start=true`)
+- `-verbose`: Enable detailed logging with task information, script details, and input/output operations
+- `-quiet`: Minimal output mode (only critical errors, overrides verbose)
 
 ### Manifest Format
 
@@ -351,6 +415,8 @@ Old tasks are preserved as historical records while new tasks reprocess with the
 - `github.com/danhab99/idk/chans`: Channel utilities for stream merging
 - `github.com/danhab99/idk/workers`: Worker pool for parallel processing
 - `github.com/pelletier/go-toml`: TOML parsing
+- `github.com/fatih/color`: Terminal color output
+- `github.com/schollz/progressbar/v3`: Progress bar visualization
 - `database/sql`: SQLite database access
 - `github.com/mattn/go-sqlite3`: SQLite driver
 - Standard Go libraries
@@ -393,12 +459,29 @@ script = "tr '[:lower:]' '[:upper:]' < $INPUT_FILE | sort > $OUTPUT_DIR/done"
 
 ## Output
 
-The program prints detailed logs during execution:
+The program provides intelligent logging based on your chosen output mode:
+
+### Normal Mode Output
 - Manifest loading and step count
-- Database initialization
+- Database initialization  
 - Tainted step detection and migration counts
-- Step execution with IDs and step names
-- Script execution details
-- Output file generation
-- Task processing counts
-- Total steps processed
+- Step execution with colored indicators
+- Real-time progress bars for each step
+- Task completion counts
+- Execution summary with statistics
+
+### Verbose Mode Output  
+Everything in Normal mode plus:
+- Step registration details
+- Database operation details
+- Input/output file paths and byte counts
+- Script commands being executed
+- Script stdout/stderr output in real-time
+- Individual task processing information
+
+### Quiet Mode Output
+- Only critical errors
+- No progress indicators
+- Suitable for CI/CD logs
+
+For complete details about visibility features, see [VISIBILITY.md](VISIBILITY.md)

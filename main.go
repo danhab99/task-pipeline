@@ -3,10 +3,10 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"runtime"
 
+	"github.com/fatih/color"
 	"github.com/pelletier/go-toml"
 )
 
@@ -21,22 +21,33 @@ func (s *stringSlice) Set(value string) error {
 	return nil
 }
 
-var mainLogger = log.New(os.Stderr, "[MAIN] ", log.Ldate|log.Ltime|log.Lmsgprefix)
+var mainLogger = NewColorLogger("[MAIN] ", color.New(color.FgMagenta, color.Bold))
 
 func main() {
 	manifest_path := flag.String("manifest", "", "manifest path")
 	db_path := flag.String("db", "./db", "database path")
 	parallel := flag.Int("parallel", runtime.NumCPU(), "number of processes to run in parallel")
 	exportName := flag.String("export", "", "export a specific step")
-	inputPath := flag.String("input-path", "", "export outputs for a specific input path")
+	// inputPath := flag.String("input-path", "", "export outputs for a specific input path")
 	runPipeline := flag.Bool("run", false, "run the pipeline")
 	startStep := flag.String("start", "", "step to start from (optional, defaults to start step in manifest)")
 	runset := flag.String("runset", "", "categorize tasks into runset groups")
+	verbose := flag.Bool("verbose", false, "enable verbose logging")
+	quiet := flag.Bool("quiet", false, "minimal output (overrides verbose)")
 
 	var enabledSteps stringSlice
 	flag.Var(&enabledSteps, "step", "steps to run")
 
 	flag.Parse()
+
+	// Set log level based on flags
+	if *quiet {
+		SetLogLevel(LogLevelQuiet)
+	} else if *verbose {
+		SetLogLevel(LogLevelVerbose)
+	} else {
+		SetLogLevel(LogLevelNormal)
+	}
 
 	mainLogger.Printf("Loading manifest from: %s", *manifest_path)
 
@@ -50,9 +61,9 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	mainLogger.Printf("Loaded %d steps from manifest", len(manifest.Steps))
+	mainLogger.Successf("Loaded %d steps from manifest", len(manifest.Steps))
 
-	mainLogger.Printf("Initializing database at: %s", *db_path)
+	mainLogger.Verbosef("Initializing database at: %s", *db_path)
 	database, err := NewDatabase(*db_path, *runset)
 	if err != nil {
 		panic(err)
@@ -61,6 +72,6 @@ func main() {
 	if *runPipeline {
 		run(manifest, database, *parallel, *startStep, enabledSteps)
 	} else if exportName != nil && *exportName != "" {
-		exportResults(database, *exportName, *inputPath)
+		exportResults(database, *exportName)
 	}
 }

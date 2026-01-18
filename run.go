@@ -1,12 +1,14 @@
 package main
 
 import (
-	"log"
-	"os"
+	"fmt"
 	"strings"
+	"time"
+
+	"github.com/fatih/color"
 )
 
-var runLogger = log.New(os.Stderr, "[RUN] ", log.Ldate|log.Ltime|log.Lmsgprefix)
+var runLogger = NewColorLogger("[RUN] ", color.New(color.FgBlue, color.Bold))
 
 func extractStepName(filename string) string {
 	base := filename
@@ -22,62 +24,64 @@ func extractStepName(filename string) string {
 }
 
 func run(manifest Manifest, database Database, parallel int, startStepName string, enabledSteps []string) {
-	allSteps := make([]Step, len(manifest.Steps))
+	startTime := time.Now()
+
+	es := make([]Step, 0, len(manifest.Steps))
+
+	for _, step := range manifest.Steps {
+		s := Step{
+			Name:     step.Name,
+			Script:   step.Script,
+			IsStart:  step.Start,
+			Parallel: step.Parallel,
+		}
+		runLogger.Verbosef("Registered step %#v\n", s)
+
+		id, err := database.CreateStep(s)
+		if err != nil {
+			panic(err)
+		}
+		s.ID = id
+		es = append(es, s)
+	}
+
+	runLogger.Printf("Registered %d steps", len(manifest.Steps))
 
 	_, err := database.CreateStep(Step{
 		Name:     "done",
-		Script:   "",
+		Script:   "true",
 		IsStart:  false,
 		Parallel: nil,
 	})
 	if err != nil {
 		panic(err)
 	}
-	runLogger.Println("Stubbed done task")
 
-	for i, step := range manifest.Steps {
-		stepID, err := database.CreateStep(Step{
-			Name:     step.Name,
-			Script:   step.Script,
-			IsStart:  step.Start,
-			Parallel: step.Parallel,
-		})
-		if err != nil {
-			panic(err)
-		}
+	runLogger.Verbosef("Stubbed done task")
 
-		step, err := database.GetStep(stepID)
-		if err != nil {
-			panic(err)
-		}
-
-		allSteps[i] = *step
-	}
-
-	runLogger.Println("Registered steps", len(manifest.Steps))
-
-	taintedSteps := 0
-	for step := range database.GetTaintedSteps() {
-		_, err := database.MigrateTaintedStepTasks(step.ID)
-		if err != nil {
-			panic(err)
-		}
-		taintedSteps++
-		runLogger.Printf("Marked step %s as tainted\n", step.Name)
-	}
-	runLogger.Printf("Marked %d steps as tainted\n", taintedSteps)
-
-	pipeline := NewPipeline(&database, allSteps)
+	pipeline := NewPipeline(&database, es)
 
 	totalExecCount := int64(0)
 	execCount := int64(1)
+	iterationNum := 0
 	for execCount > 0 {
-		runLogger.Println("--- BEGIN EXECUTION ---")
+		iterationNum++
+		runLogger.Printf("╔══════ Execution Round %d ══════╗", iterationNum)
 		c := pipeline.Execute(startStepName, parallel)
-		runLogger.Printf("Execution finished with %d\n", c)
+		runLogger.Successf("Round %d completed: %d tasks processed", iterationNum, c)
 		execCount = c
 		totalExecCount += c
 	}
 
-	runLogger.Printf("Completed processing %d tasks", totalExecCount)
+	elapsed := time.Since(startTime)
+
+	PrintSummary("Pipeline Execution Summary", map[string]interface{}{
+		"Total Tasks":      totalExecCount,
+		"Total Rounds":     iterationNum,
+		"Parallel Workers": parallel,
+		"Execution Time":   elapsed.Round(time.Millisecond),
+		"Avg Task Rate":    fmt.Sprintf("%.2f tasks/sec", float64(totalExecCount)/elapsed.Seconds()),
+	})
+
+	runLogger.Successf("Pipeline completed successfully!")
 }
