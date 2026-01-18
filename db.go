@@ -14,11 +14,13 @@ var dbLogger = log.New(os.Stderr, "[DB] ", log.Ldate|log.Ltime|log.Lmsgprefix)
 const schema string = `
 CREATE TABLE IF NOT EXISTS step (
   id        INTEGER PRIMARY KEY AUTOINCREMENT,
-  name      TEXT UNIQUE NOT NULL,
+  name      TEXT NOT NULL,
   script    TEXT NOT NULL,
   is_start  INTEGER DEFAULT 0,
   parallel  INTEGER,
-  processed INTEGER DEFAULT 0
+  processed INTEGER DEFAULT 0,
+  version   INTEGER DEFAULT 1,
+  UNIQUE(name, version)
 );
 
 CREATE TABLE IF NOT EXISTS task (
@@ -31,8 +33,7 @@ CREATE TABLE IF NOT EXISTS task (
 	runset           TEXT DEFAULT (CURRENT_TIMESTAMP),
 
   FOREIGN KEY(step_id) REFERENCES step(id),
-  FOREIGN KEY(input_task_id) REFERENCES task(id),
-  UNIQUE(object_hash, step_id, input_task_id)
+  FOREIGN KEY(input_task_id) REFERENCES task(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_step_name ON step(name);
@@ -54,6 +55,7 @@ type Step struct {
 	IsStart   bool
 	Parallel  *int
 	Processed bool
+	Version   int
 }
 
 type Task struct {
@@ -96,7 +98,7 @@ func NewDatabase(repo_path string, runset string) (Database, error) {
 		return Database{}, err
 	}
 
-	dbLogger.Printf("Opening database at %s/db\n", repo_path)
+	dbLogger.Printf("Opening database at %s/db", repo_path)
 	db, err := sql.Open("sqlite3", fmt.Sprintf("%s/db", repo_path))
 	if err != nil {
 		return Database{}, err
@@ -118,152 +120,102 @@ func NewDatabase(repo_path string, runset string) (Database, error) {
 // Step CRUD operations
 
 func (d Database) CreateStep(step Step) (int64, error) {
-	dbLogger.Printf("CreateStep: name=%s, is_start=%v, parallel=%v, processed=%v", step.Name, step.IsStart, step.Parallel, step.Processed)
-	// Check if step exists first
-	existing, err := d.GetStepByName(step.Name)
-	if err != nil {
+	// Check if a step with the same name and script already exists
+	var existingID int64
+	err := d.db.QueryRow("SELECT id FROM step WHERE name = ? AND script = ? LIMIT 1", step.Name, step.Script).Scan(&existingID)
+	if err == nil {
+		// Step with same name and script exists, return its ID
+		return existingID, nil
+	}
+	if err != sql.ErrNoRows {
 		return 0, err
 	}
 
-	if existing != nil {
-		// Step exists, update it and return existing ID
-		isCurrent := 1
-		if !step.IsCurrent {
-			isCurrent = 0
-		}
-		_, err = d.db.Exec(`
-UPDATE step 
-SET script = ?, is_start = ?, parallel = ?, processed = ?, previous_step_id = ?, is_current = ?
-WHERE id = ?
-`, step.Script, step.IsStart, step.Parallel, step.Processed, step.PreviousStepID, isCurrent, existing.ID)
-		if err != nil {
-			return 0, err
-		}
-		dbLogger.Printf("CreateStep: updated existing step, id=%d", existing.ID)
-		return existing.ID, nil
+	// Get the max version for this step name
+	var maxVersion sql.NullInt64
+	err = d.db.QueryRow("SELECT MAX(version) FROM step WHERE name = ?", step.Name).Scan(&maxVersion)
+	if err != nil && err != sql.ErrNoRows {
+		return 0, err
 	}
 
-	// Step doesn't exist, create it - default is_current to 1 if not explicitly set to false
-	isCurrent := 1
-	if step.IsCurrent == false && step.PreviousStepID != nil {
-		// Only set to 0 if explicitly false AND has a previous step (i.e., is a historical version)
-		isCurrent = 0
+	version := 1
+	if maxVersion.Valid {
+		version = int(maxVersion.Int64) + 1
 	}
+
 	res, err := d.db.Exec(`
-INSERT INTO step (name, script, is_start, parallel, processed, previous_step_id, is_current)
-VALUES (?, ?, ?, ?, ?, ?, ?)
-`, step.Name, step.Script, step.IsStart, step.Parallel, step.Processed, step.PreviousStepID, isCurrent)
+INSERT INTO step (name, script, is_start, parallel, processed, version)
+VALUES (?, ?, ?, ?, ?, ?)
+`, step.Name, step.Script, step.IsStart, step.Parallel, step.Processed, version)
 	if err != nil {
 		return 0, err
 	}
-	id, err := res.LastInsertId()
-	dbLogger.Printf("CreateStep: created new step, id=%d", id)
-	return id, err
+	return res.LastInsertId()
 }
 
 func (d Database) GetStep(id int64) (*Step, error) {
-	dbLogger.Printf("GetStep: id=%d", id)
 	var step Step
-	var parallel, previousStepID sql.NullInt64
-	var isStart, processed, isCurrent int
-	err := d.db.QueryRow("SELECT id, name, script, is_start, parallel, processed, previous_step_id, is_current FROM step WHERE id = ?", id).Scan(
-		&step.ID, &step.Name, &step.Script, &isStart, &parallel, &processed, &previousStepID, &isCurrent,
+	var parallel sql.NullInt64
+	err := d.db.QueryRow("SELECT id, name, script, is_start, parallel, processed, version FROM step WHERE id = ?", id).Scan(
+		&step.ID, &step.Name, &step.Script, &step.IsStart, &parallel, &step.Processed, &step.Version,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			dbLogger.Printf("GetStep: not found")
 			return nil, nil
 		}
 		return nil, err
 	}
-	step.IsStart = isStart != 0
-	step.Processed = processed != 0
-	step.IsCurrent = isCurrent != 0
 	if parallel.Valid {
 		val := int(parallel.Int64)
 		step.Parallel = &val
 	}
-	if previousStepID.Valid {
-		val := previousStepID.Int64
-		step.PreviousStepID = &val
-	}
-	dbLogger.Printf("GetStep: found name=%s", step.Name)
 	return &step, nil
 }
 
 func (d Database) GetStepByName(name string) (*Step, error) {
-	dbLogger.Printf("GetStepByName: name=%s", name)
 	var step Step
-	var parallel, previousStepID sql.NullInt64
-	var isStart, processed, isCurrent int
-	err := d.db.QueryRow("SELECT id, name, script, is_start, parallel, processed, previous_step_id, is_current FROM step WHERE name = ? AND is_current = 1", name).Scan(
-		&step.ID, &step.Name, &step.Script, &isStart, &parallel, &processed, &previousStepID, &isCurrent,
+	var parallel sql.NullInt64
+	err := d.db.QueryRow("SELECT id, name, script, is_start, parallel, processed, version FROM step WHERE name = ? ORDER BY version DESC LIMIT 1", name).Scan(
+		&step.ID, &step.Name, &step.Script, &step.IsStart, &parallel, &step.Processed, &step.Version,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			dbLogger.Printf("GetStepByName: not found")
 			return nil, nil
 		}
 		return nil, err
 	}
-	step.IsStart = isStart != 0
-	step.Processed = processed != 0
-	step.IsCurrent = isCurrent != 0
 	if parallel.Valid {
 		val := int(parallel.Int64)
 		step.Parallel = &val
 	}
-	if previousStepID.Valid {
-		val := previousStepID.Int64
-		step.PreviousStepID = &val
-	}
-	dbLogger.Printf("GetStepByName: found id=%d", step.ID)
 	return &step, nil
 }
 
 func (d Database) GetStartingStep() (*Step, error) {
-	dbLogger.Printf("GetStartingStep")
 	var step Step
-	var parallel, previousStepID sql.NullInt64
-	var isStart, processed, isCurrent int
-	err := d.db.QueryRow("SELECT id, name, script, is_start, parallel, processed, previous_step_id, is_current FROM step WHERE is_start = 1 AND is_current = 1 LIMIT 1").Scan(
-		&step.ID, &step.Name, &step.Script, &isStart, &parallel, &processed, &previousStepID, &isCurrent,
+	var parallel sql.NullInt64
+	err := d.db.QueryRow("SELECT id, name, script, is_start, parallel, processed, version FROM step WHERE is_start = 1 ORDER BY version DESC LIMIT 1").Scan(
+		&step.ID, &step.Name, &step.Script, &step.IsStart, &parallel, &step.Processed, &step.Version,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			dbLogger.Printf("GetStartingStep: not found")
 			return nil, nil
 		}
 		return nil, err
 	}
-	step.IsStart = isStart != 0
-	step.Processed = processed != 0
-	step.IsCurrent = isCurrent != 0
 	if parallel.Valid {
 		val := int(parallel.Int64)
 		step.Parallel = &val
 	}
-	if previousStepID.Valid {
-		val := previousStepID.Int64
-		step.PreviousStepID = &val
-	}
-	dbLogger.Printf("GetStartingStep: found id=%d, name=%s", step.ID, step.Name)
 	return &step, nil
 }
 
 func (d Database) DeleteStep(id int64) error {
-	dbLogger.Printf("DeleteStep: id=%d", id)
 	_, err := d.db.Exec("DELETE FROM step WHERE id = ?", id)
-	if err != nil {
-		dbLogger.Printf("DeleteStep: error=%v", err)
-	} else {
-		dbLogger.Printf("DeleteStep: success")
-	}
 	return err
 }
 
 func (d Database) UpdateStepStatus(id int64, processed bool) error {
-	dbLogger.Printf("UpdateStepStatus: id=%d, processed=%v", id, processed)
 	p := 0
 	if processed {
 		p = 1
@@ -274,54 +226,28 @@ UPDATE step
 SET processed = ?
 WHERE id = ?
 `, p, id)
-	if err != nil {
-		dbLogger.Printf("UpdateStepStatus: error=%v", err)
-	} else {
-		dbLogger.Printf("UpdateStepStatus: success")
-	}
-	return err
-}
-
-func (d Database) UpdateStepScriptHash(id int64, scriptHash string) error {
-	dbLogger.Printf("UpdateStepScriptHash: id=%d, hash=%s", id, scriptHash)
-	_, err := d.db.Exec(`
-UPDATE step 
-SET script = ?
-WHERE id = ?
-`, scriptHash, id)
-	if err != nil {
-		dbLogger.Printf("UpdateStepScriptHash: error=%v", err)
-	} else {
-		dbLogger.Printf("UpdateStepScriptHash: success")
-	}
 	return err
 }
 
 func (d Database) CountSteps() (int64, error) {
-	dbLogger.Printf("CountSteps")
 	var count int64
 	err := d.db.QueryRow("SELECT COUNT(*) FROM step").Scan(&count)
-	dbLogger.Printf("CountSteps: count=%d", count)
 	return count, err
 }
 
 func (d Database) CountStepsWithoutParallel() (int64, error) {
-	dbLogger.Printf("CountStepsWithoutParallel")
 	var count int64
 	err := d.db.QueryRow("SELECT COUNT(*) FROM step WHERE parallel IS NOT NULL").Scan(&count)
-	dbLogger.Printf("CountStepsWithoutParallel: count=%d", count)
 	return count, err
 }
 
 func (d Database) ListSteps() chan Step {
-	dbLogger.Printf("ListSteps")
 	stepChan := make(chan Step)
 
 	go func() {
 		defer close(stepChan)
-		count := 0
 
-		rows, err := d.db.Query("SELECT id, name, script, is_start, parallel, processed, previous_step_id, is_current FROM step WHERE is_current = 1 ORDER BY id")
+		rows, err := d.db.Query("SELECT id, name, script, is_start, parallel, processed, version FROM step ORDER BY id")
 		if err != nil {
 			panic(err)
 		}
@@ -329,30 +255,62 @@ func (d Database) ListSteps() chan Step {
 
 		for rows.Next() {
 			var step Step
-			var parallel, previousStepID sql.NullInt64
-			var isStart, processed, isCurrent int
-			if err := rows.Scan(&step.ID, &step.Name, &step.Script, &isStart, &parallel, &processed, &previousStepID, &isCurrent); err != nil {
+			var parallel sql.NullInt64
+			if err := rows.Scan(&step.ID, &step.Name, &step.Script, &step.IsStart, &parallel, &step.Processed, &step.Version); err != nil {
 				panic(err)
 			}
-			step.IsStart = isStart != 0
-			step.Processed = processed != 0
-			step.IsCurrent = isCurrent != 0
 			if parallel.Valid {
 				val := int(parallel.Int64)
 				step.Parallel = &val
 			}
-			if previousStepID.Valid {
-				val := previousStepID.Int64
-				step.PreviousStepID = &val
-			}
 			stepChan <- step
-			count++
 		}
 
 		if err := rows.Err(); err != nil {
 			panic(err)
 		}
-		dbLogger.Printf("ListSteps: returned %d steps", count)
+	}()
+
+	return stepChan
+}
+
+func (d Database) GetTaintedSteps() chan Step {
+	stepChan := make(chan Step)
+
+	go func() {
+		defer close(stepChan)
+
+		// Find all steps where there's a newer version with a different script
+		rows, err := d.db.Query(`
+			SELECT s1.id, s1.name, s1.script, s1.is_start, s1.parallel, s1.processed, s1.version
+			FROM step s1
+			INNER JOIN step s2 ON s1.name = s2.name
+			WHERE s1.version < s2.version
+			  AND s1.script != s2.script
+			GROUP BY s1.id
+			ORDER BY s1.name, s1.version
+		`)
+		if err != nil {
+			panic(err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var step Step
+			var parallel sql.NullInt64
+			if err := rows.Scan(&step.ID, &step.Name, &step.Script, &step.IsStart, &parallel, &step.Processed, &step.Version); err != nil {
+				panic(err)
+			}
+			if parallel.Valid {
+				val := int(parallel.Int64)
+				step.Parallel = &val
+			}
+			stepChan <- step
+		}
+
+		if err := rows.Err(); err != nil {
+			panic(err)
+		}
 	}()
 
 	return stepChan
@@ -361,7 +319,6 @@ func (d Database) ListSteps() chan Step {
 // Task CRUD operations
 
 func (d Database) CreateTask(task Task) (int64, error) {
-	dbLogger.Printf("CreateTask: object_hash=%s, step_id=%v, input_task_id=%v, processed=%v", task.ObjectHash, task.StepID, task.InputTaskID, task.Processed)
 	p := 0
 	if task.Processed {
 		p = 1
@@ -389,78 +346,100 @@ VALUES (?, ?, ?, ?, ?, ?);
 		if err != nil {
 			return 0, fmt.Errorf("failed to find existing task after ignored insert: %w", err)
 		}
-		dbLogger.Printf("CreateTask: found existing task, id=%d", existingID)
 		return existingID, nil
 	}
 
-	dbLogger.Printf("CreateTask: created new task, id=%d", id)
 	return id, nil
 }
 
 func (d Database) GetTask(id int64) (*Task, error) {
-	dbLogger.Printf("GetTask: id=%d", id)
 	var t Task
-	var processed int
 	err := d.db.QueryRow("SELECT id, object_hash, step_id, input_task_id, processed, error FROM task WHERE id = ?", id).Scan(
-		&t.ID, &t.ObjectHash, &t.StepID, &t.InputTaskID, &processed, &t.Error,
+		&t.ID, &t.ObjectHash, &t.StepID, &t.InputTaskID, &t.Processed, &t.Error,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			dbLogger.Printf("GetTask: not found")
 			return nil, nil
 		}
 		return nil, err
 	}
-	t.Processed = processed != 0
-	dbLogger.Printf("GetTask: found object_hash=%s", t.ObjectHash)
 	return &t, nil
 }
 
 func (d Database) TaskExists(id int64) (bool, error) {
-	dbLogger.Printf("TaskExists: id=%d", id)
 	var exists bool
 	err := d.db.QueryRow("SELECT EXISTS(SELECT 1 FROM task WHERE id = ?)", id).Scan(&exists)
-	dbLogger.Printf("TaskExists: exists=%v", exists)
 	return exists, err
 }
 
 func (d Database) UpdateTaskStatus(id int64, processed bool, errorMsg *string) error {
-	dbLogger.Printf("UpdateTaskStatus: id=%d, processed=%v, error=%v", id, processed, errorMsg)
-	p := 0
-	if processed {
-		p = 1
-	}
 	_, err := d.db.Exec(`
 UPDATE task 
 SET processed = ?, error = ?
 WHERE id = ?
-`, p, errorMsg, id)
-	if err != nil {
-		dbLogger.Printf("UpdateTaskStatus: error=%v", err)
-	} else {
-		dbLogger.Printf("UpdateTaskStatus: success")
-	}
+`, processed, errorMsg, id)
 	return err
 }
 
-func (d Database) DeleteTask(id int64) error {
-	dbLogger.Printf("DeleteTask: id=%d", id)
-	_, err := d.db.Exec("DELETE FROM task WHERE id = ?", id)
+func (d Database) MarkStepTasksUnprocessed(stepID int64) error {
+	// runtime.Breakpoint()
+	_, err := d.db.Exec(`
+UPDATE task 
+SET processed = 0, error = NULL
+WHERE step_id = ?
+`, stepID)
+	return err
+}
+
+func (d Database) MigrateTaintedStepTasks(taintedStepID int64) (int64, error) {
+	// Get the tainted step to find its name
+	taintedStep, err := d.GetStep(taintedStepID)
 	if err != nil {
-		dbLogger.Printf("DeleteTask: error=%v", err)
-	} else {
-		dbLogger.Printf("DeleteTask: success")
+		return 0, err
 	}
+	if taintedStep == nil {
+		return 0, fmt.Errorf("step with id %d not found", taintedStepID)
+	}
+
+	// Get the latest version of the step
+	latestStep, err := d.GetStepByName(taintedStep.Name)
+	if err != nil {
+		return 0, err
+	}
+	if latestStep == nil {
+		return 0, fmt.Errorf("no step found with name %s", taintedStep.Name)
+	}
+
+	// Copy all tasks from tainted step to latest step as new unprocessed tasks
+	// This preserves the old tasks as historical records
+	result, err := d.db.Exec(`
+INSERT INTO task (object_hash, step_id, input_task_id, processed, error, runset)
+SELECT object_hash, ?, input_task_id, 0, NULL, runset
+FROM task
+WHERE step_id = ?
+`, latestStep.ID, taintedStepID)
+	if err != nil {
+		return 0, err
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+
+	return rowsAffected, nil
+}
+
+func (d Database) DeleteTask(id int64) error {
+	_, err := d.db.Exec("DELETE FROM task WHERE id = ?", id)
 	return err
 }
 
 func (d Database) ListTasks() chan Task {
-	dbLogger.Printf("ListTasks")
 	taskChan := make(chan Task)
 
 	go func() {
 		defer close(taskChan)
-		count := 0
 
 		rows, err := d.db.Query("SELECT id, object_hash, step_id, input_task_id, processed, error FROM task ORDER BY id")
 		if err != nil {
@@ -470,19 +449,15 @@ func (d Database) ListTasks() chan Task {
 
 		for rows.Next() {
 			var t Task
-			var processed int
-			if err := rows.Scan(&t.ID, &t.ObjectHash, &t.StepID, &t.InputTaskID, &processed, &t.Error); err != nil {
+			if err := rows.Scan(&t.ID, &t.ObjectHash, &t.StepID, &t.InputTaskID, &t.Processed, &t.Error); err != nil {
 				panic(err)
 			}
-			t.Processed = processed != 0
 			taskChan <- t
-			count++
 		}
 
 		if err := rows.Err(); err != nil {
 			panic(err)
 		}
-		dbLogger.Printf("ListTasks: returned %d tasks", count)
 	}()
 
 	return taskChan
@@ -491,12 +466,10 @@ func (d Database) ListTasks() chan Task {
 // Relational operators
 
 func (d Database) GetTasksForStep(stepID int64) chan Task {
-	dbLogger.Printf("GetTasksForStep: step_id=%d", stepID)
 	taskChan := make(chan Task)
 
 	go func() {
 		defer close(taskChan)
-		count := 0
 
 		rows, err := d.db.Query(`
 			SELECT id, object_hash, step_id, input_task_id, processed, error 
@@ -511,87 +484,50 @@ func (d Database) GetTasksForStep(stepID int64) chan Task {
 
 		for rows.Next() {
 			var t Task
-			var processed int
-			if err := rows.Scan(&t.ID, &t.ObjectHash, &t.StepID, &t.InputTaskID, &processed, &t.Error); err != nil {
+			if err := rows.Scan(&t.ID, &t.ObjectHash, &t.StepID, &t.InputTaskID, &t.Processed, &t.Error); err != nil {
 				panic(err)
 			}
-			t.Processed = processed != 0
 			taskChan <- t
-			count++
 		}
 
 		if err := rows.Err(); err != nil {
 			panic(err)
 		}
-		dbLogger.Printf("GetTasksForStep: step_id=%d, returned %d tasks", stepID, count)
 	}()
 
 	return taskChan
 }
 
 func (d Database) CountUnprocessedTasks() (int64, error) {
-	dbLogger.Printf("CountUnprocessedTasks")
 	row := d.db.QueryRow("SELECT COUNT(*) FROM task WHERE processed = 0")
 	var count int64
 	err := row.Scan(&count)
-	dbLogger.Printf("CountUnprocessedTasks: count=%d", count)
 	return count, err
 }
 
 func (d Database) CountTasksForStep(stepID int64) (int64, error) {
-	dbLogger.Printf("CountTasksForStep: step_id=%d", stepID)
 	row := d.db.QueryRow("SELECT COUNT(*) FROM task WHERE step_id = ?", stepID)
 	var count int64
 	err := row.Scan(&count)
-	dbLogger.Printf("CountTasksForStep: step_id=%d, count=%d", stepID, count)
 	return count, err
 }
 
 func (d Database) CountUnprocessedTasksForStep(stepID int64) (int64, error) {
-	dbLogger.Printf("CountUnprocessedTasksForStep: step_id=%d", stepID)
 	row := d.db.QueryRow("SELECT COUNT(*) FROM task WHERE step_id = ? AND processed = 0", stepID)
 	var count int64
 	err := row.Scan(&count)
-	dbLogger.Printf("CountUnprocessedTasksForStep: step_id=%d, count=%d", stepID, count)
 	return count, err
 }
 
-func (d Database) MarkAllTasksUnprocessedForStep(stepID int64) error {
-	dbLogger.Printf("MarkAllTasksUnprocessedForStep: step_id=%d", stepID)
-	result, err := d.db.Exec("UPDATE task SET processed = 0 WHERE step_id = ?", stepID)
-	if err != nil {
-		return err
-	}
-	rowsAffected, _ := result.RowsAffected()
-	dbLogger.Printf("MarkAllTasksUnprocessedForStep: step_id=%d, updated %d tasks", stepID, rowsAffected)
-	return nil
-}
-
-func (d Database) DeleteAllTasksForStep(stepID int64) error {
-	dbLogger.Printf("DeleteAllTasksForStep: step_id=%d", stepID)
-	result, err := d.db.Exec("DELETE FROM task WHERE step_id = ?", stepID)
-	if err != nil {
-		dbLogger.Printf("DeleteAllTasksForStep: error=%v", err)
-		return err
-	}
-	rowsAffected, _ := result.RowsAffected()
-	dbLogger.Printf("DeleteAllTasksForStep: step_id=%d, deleted %d tasks", stepID, rowsAffected)
-	return nil
-}
-
 func (d Database) IsStepComplete(stepID int64) (bool, error) {
-	dbLogger.Printf("IsStepComplete: step_id=%d", stepID)
 	count, err := d.CountUnprocessedTasksForStep(stepID)
 	if err != nil {
 		return false, err
 	}
-	isComplete := count == 0
-	dbLogger.Printf("IsStepComplete: step_id=%d, complete=%v", stepID, isComplete)
-	return isComplete, nil
+	return count == 0, nil
 }
 
 func (d Database) CheckAndMarkStepComplete(stepID int64) (bool, error) {
-	dbLogger.Printf("CheckAndMarkStepComplete: step_id=%d", stepID)
 	isComplete, err := d.IsStepComplete(stepID)
 	if err != nil {
 		return false, err
@@ -609,28 +545,23 @@ func (d Database) CheckAndMarkStepComplete(stepID int64) (bool, error) {
 			if err != nil {
 				return false, err
 			}
-			dbLogger.Printf("Step %d (%s) marked as complete\n", stepID, step.Name)
+			dbLogger.Printf("Step %d (%s) marked as complete", stepID, step.Name)
 		}
 	}
 
-	dbLogger.Printf("CheckAndMarkStepComplete: step_id=%d, complete=%v", stepID, isComplete)
 	return isComplete, nil
 }
 
 func (d Database) AreAllStepsComplete() (bool, error) {
-	dbLogger.Printf("AreAllStepsComplete")
 	var incompleteCount int64
 	err := d.db.QueryRow("SELECT COUNT(*) FROM step WHERE processed = 0").Scan(&incompleteCount)
 	if err != nil {
 		return false, err
 	}
-	allComplete := incompleteCount == 0
-	dbLogger.Printf("AreAllStepsComplete: complete=%v, incomplete_count=%d", allComplete, incompleteCount)
-	return allComplete, nil
+	return incompleteCount == 0, nil
 }
 
 func (d Database) GetPipelineStatus() (complete bool, totalTasks int64, processedTasks int64, err error) {
-	dbLogger.Printf("GetPipelineStatus")
 	err = d.db.QueryRow("SELECT COUNT(*) FROM task").Scan(&totalTasks)
 	if err != nil {
 		return false, 0, 0, err
@@ -642,60 +573,56 @@ func (d Database) GetPipelineStatus() (complete bool, totalTasks int64, processe
 	}
 
 	complete = totalTasks > 0 && totalTasks == processedTasks
-	dbLogger.Printf("GetPipelineStatus: complete=%v, total=%d, processed=%d", complete, totalTasks, processedTasks)
 	return complete, totalTasks, processedTasks, nil
 }
 
 func (d Database) GetUnprocessedTasks(stepID int64) chan Task {
-	dbLogger.Printf("GetUnprocessedTasks: step_id=%d", stepID)
 	taskChan := make(chan Task)
 
 	go func() {
 		defer close(taskChan)
-		count := 0
 
 		rows, err := d.db.Query(`
 			SELECT id, object_hash, step_id, input_task_id, processed, error 
 			FROM task 
 			WHERE step_id = ? 
 			  AND processed = 0
-			  AND id NOT IN (SELECT DISTINCT input_task_id FROM task WHERE input_task_id IS NOT NULL)
+			  AND (
+			    id NOT IN (SELECT DISTINCT input_task_id FROM task WHERE input_task_id IS NOT NULL)
+			    OR id IN (SELECT DISTINCT t1.id FROM task t1 
+			              INNER JOIN task t2 ON t1.id = t2.input_task_id 
+			              WHERE t1.step_id = ? AND t1.processed = 0)
+			  )
 			ORDER BY id
-		`, stepID)
+		`, stepID, stepID)
 		if err != nil {
-			dbLogger.Printf("Error querying unprocessed tasks for step %d: %v\n", stepID, err)
+			dbLogger.Printf("Error querying unprocessed tasks for step %d: %v", stepID, err)
 			return
 		}
 		defer rows.Close()
 
 		for rows.Next() {
 			var t Task
-			var processed int
-			if err := rows.Scan(&t.ID, &t.ObjectHash, &t.StepID, &t.InputTaskID, &processed, &t.Error); err != nil {
-				dbLogger.Printf("Error scanning task for step %d: %v\n", stepID, err)
+			if err := rows.Scan(&t.ID, &t.ObjectHash, &t.StepID, &t.InputTaskID, &t.Processed, &t.Error); err != nil {
+				dbLogger.Printf("Error scanning task for step %d: %v", stepID, err)
 				return
 			}
-			t.Processed = processed != 0
 			taskChan <- t
-			count++
 		}
 
 		if err := rows.Err(); err != nil {
-			dbLogger.Printf("Error iterating tasks for step %d: %v\n", stepID, err)
+			dbLogger.Printf("Error iterating tasks for step %d: %v", stepID, err)
 		}
-		dbLogger.Printf("GetUnprocessedTasks: step_id=%d, returned %d tasks", stepID, count)
 	}()
 
 	return taskChan
 }
 
 func (d Database) GetNextTasks(taskID int64) chan Task {
-	dbLogger.Printf("GetNextTasks: task_id=%d", taskID)
 	taskChan := make(chan Task)
 
 	go func() {
 		defer close(taskChan)
-		count := 0
 
 		rows, err := d.db.Query(`
 			SELECT id, object_hash, step_id, input_task_id, processed, error 
@@ -710,26 +637,21 @@ func (d Database) GetNextTasks(taskID int64) chan Task {
 
 		for rows.Next() {
 			var t Task
-			var processed int
-			if err := rows.Scan(&t.ID, &t.ObjectHash, &t.StepID, &t.InputTaskID, &processed, &t.Error); err != nil {
+			if err := rows.Scan(&t.ID, &t.ObjectHash, &t.StepID, &t.InputTaskID, &t.Processed, &t.Error); err != nil {
 				panic(err)
 			}
-			t.Processed = processed != 0
 			taskChan <- t
-			count++
 		}
 
 		if err := rows.Err(); err != nil {
 			panic(err)
 		}
-		dbLogger.Printf("GetNextTasks: task_id=%d, returned %d tasks", taskID, count)
 	}()
 
 	return taskChan
 }
 
 func (d Database) IsTaskCompletedInNextStep(nextStepID, taskID int64) (bool, error) {
-	dbLogger.Printf("IsTaskCompletedInNextStep: next_step_id=%d, task_id=%d", nextStepID, taskID)
 	var completed bool
 	err := d.db.QueryRow(`
 		SELECT EXISTS(
@@ -737,7 +659,6 @@ func (d Database) IsTaskCompletedInNextStep(nextStepID, taskID int64) (bool, err
 			WHERE step_id = ? AND input_task_id = ? AND processed = 1
 		)
 	`, nextStepID, taskID).Scan(&completed)
-	dbLogger.Printf("IsTaskCompletedInNextStep: next_step_id=%d, task_id=%d, completed=%v", nextStepID, taskID, completed)
 	return completed, err
 }
 
@@ -763,54 +684,5 @@ func (d *Database) CreateAndGetTask(t Task) (*Task, error) {
 		return nil, err
 	}
 
-	task, err := d.GetTask(taskId)
-	if err == nil && task != nil {
-		dbLogger.Printf("CreateAndGetTask: object_hash=%s, step_id=%v, input_task_id=%v -> returned task id=%d", t.ObjectHash, t.StepID, t.InputTaskID, task.ID)
-	}
-	return task, err
-}
-
-func (db *Database) RegisterStep(name, script string, isStart bool, parallel *int) *Step {
-	dbLogger.Printf("RegisterStep: name=%s, isStart=%v, parallel=%v\n", name, isStart, parallel)
-	existingStartStep, err := db.GetStepByName(name)
-	if err != nil {
-		panic(err)
-	}
-
-	if existingStartStep == nil {
-		dbLogger.Printf("RegisterStep: step '%s' not found, creating new step\n", name)
-		stepId, err := db.CreateStep(Step{
-			Name:     name,
-			Script:   script,
-			IsStart:  isStart,
-			Parallel: parallel,
-		})
-		if err != nil {
-			panic(err)
-		}
-
-		s, err := db.GetStep(stepId)
-		if err != nil {
-			panic(err)
-		}
-
-		dbLogger.Printf("RegisterStep: created new step '%s' with id=%d\n", name, s.ID)
-		return s
-	} else if existingStartStep.Script != script {
-		dbLogger.Printf("RegisterStep: step '%s' exists (id=%d) but script changed, updating\n", name, existingStartStep.ID)
-		err := db.UpdateStepScriptHash(existingStartStep.ID, script)
-		if err != nil {
-			panic(err)
-		}
-
-		err = db.MarkAllTasksUnprocessedForStep(existingStartStep.ID)
-		if err != nil {
-			panic(err)
-		}
-		dbLogger.Printf("RegisterStep: updated step '%s' script and marked tasks as unprocessed\n", name)
-	} else {
-		dbLogger.Printf("RegisterStep: step '%s' exists (id=%d) with same script, no changes needed\n", name, existingStartStep.ID)
-	}
-
-	return existingStartStep
+	return d.GetTask(taskId)
 }

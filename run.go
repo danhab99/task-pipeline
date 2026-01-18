@@ -24,13 +24,6 @@ func extractStepName(filename string) string {
 func run(manifest Manifest, database Database, parallel int, startStepName string, enabledSteps []string) {
 	allSteps := make([]Step, len(manifest.Steps))
 
-	for i, step := range manifest.Steps {
-		step := database.RegisterStep(step.Name, step.Script, step.Start, step.Parallel)
-		allSteps[i] = *step
-	}
-
-	runLogger.Println("Registered steps", len(manifest.Steps))
-
 	_, err := database.CreateStep(Step{
 		Name:     "done",
 		Script:   "",
@@ -40,8 +33,39 @@ func run(manifest Manifest, database Database, parallel int, startStepName strin
 	if err != nil {
 		panic(err)
 	}
-
 	runLogger.Println("Stubbed done task")
+
+	for i, step := range manifest.Steps {
+		stepID, err := database.CreateStep(Step{
+			Name:     step.Name,
+			Script:   step.Script,
+			IsStart:  step.Start,
+			Parallel: step.Parallel,
+		})
+		if err != nil {
+			panic(err)
+		}
+
+		step, err := database.GetStep(stepID)
+		if err != nil {
+			panic(err)
+		}
+
+		allSteps[i] = *step
+	}
+
+	runLogger.Println("Registered steps", len(manifest.Steps))
+
+	taintedSteps := 0
+	for step := range database.GetTaintedSteps() {
+		_, err := database.MigrateTaintedStepTasks(step.ID)
+		if err != nil {
+			panic(err)
+		}
+		taintedSteps++
+		runLogger.Printf("Marked step %s as tainted\n", step.Name)
+	}
+	runLogger.Printf("Marked %d steps as tainted\n", taintedSteps)
 
 	pipeline := NewPipeline(&database, allSteps)
 
