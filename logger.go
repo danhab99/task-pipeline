@@ -4,6 +4,8 @@ import (
 	"io"
 	"log"
 	"os"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -54,9 +56,10 @@ type ColorLogger struct {
 // NewColorLogger creates a new colored logger
 func NewColorLogger(prefix string, c *color.Color) *ColorLogger {
 	flags := log.Ltime | log.Lmsgprefix
+	_, file, line, _ := runtime.Caller(, 1)
 
 	return &ColorLogger{
-		prefix:     prefix,
+		prefix:     fmt.Sprintf("%s:%d@%s", file, line, prefix),
 		color:      c,
 		verbose:    log.New(os.Stderr, c.Sprint(prefix), flags),
 		normal:     log.New(os.Stderr, c.Sprint(prefix), flags),
