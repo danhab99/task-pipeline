@@ -45,10 +45,6 @@ func copyFileWithSHA256(src, dst string) (string, error) {
 		return "", err
 	}
 
-	if err := out.Sync(); err != nil {
-		return "", err
-	}
-
 	sum := hasher.Sum(nil)
 	return fmt.Sprintf("%x", sum), nil
 }

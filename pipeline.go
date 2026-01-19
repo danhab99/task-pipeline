@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"runtime"
 
 	"sync"
 
@@ -18,11 +17,10 @@ import (
 type Pipeline struct {
 	db           *Database
 	enabledSteps []Step
-	tracker      *TaskTracker
 }
 
 func NewPipeline(d *Database, steps []Step) Pipeline {
-	return Pipeline{d, steps, NewTaskTracker()}
+	return Pipeline{d, steps}
 }
 
 var pipelineLogger = NewColorLogger("[PIPELINE] ", color.New(color.FgCyan, color.Bold))
@@ -52,10 +50,8 @@ func (p *Pipeline) Execute(startStepName string, maxParallel int) int64 {
 	p.Seed()
 
 	for _, step := range stepsIndex {
-		numberOfExecutions += p.ExecuteStep(step)
+		numberOfExecutions += p.ExecuteStep(step, maxParallel)
 	}
-
-	p.tracker.PrintPipelineSummary(len(stepsIndex), numberOfExecutions)
 
 	return numberOfExecutions
 }
@@ -68,7 +64,8 @@ func (p Pipeline) ExecuteTask(t Task) {
 		panic(err)
 	}
 
-	p.tracker.StartTask(t.ID, step.Name, t.ObjectHash)
+	color.New(color.FgMagenta).Fprintf(os.Stderr, "  → ")
+	pipelineLogger.Printf("Task %d | Step: %s", t.ID, color.New(color.FgMagenta, color.Bold).Sprint(step.Name))
 
 	t.Processed = true
 
@@ -159,145 +156,69 @@ func (p Pipeline) ExecuteTask(t Task) {
 		panic(err)
 	}
 
-	entriesChan := make(chan os.DirEntry)
-
-	go func() {
-		defer close(entriesChan)
-		for _, entry := range entries {
-			entriesChan <- entry
-		}
-	}()
-
 	err = db.UpdateTaskStatus(t.ID, true, nil)
 	if err != nil {
 		panic(err)
 	}
 
-	// Track scheduled tasks before completing
-	scheduledBefore := p.tracker.GetScheduledSummary()
+	for _, entry := range entries {
+		if entry.IsDir() {
+			return
+		}
 
-	type UnfinishedTask struct {
-		task  Task
-		step  *Step
-		entry os.DirEntry
-	}
+		filename := entry.Name()
+		stepName := extractStepName(filename)
+		filePath := fmt.Sprintf("%s/%s", outputDir, filename)
 
-	unfinishedTasksChan := make(chan UnfinishedTask)
+		var isCompleted bool
 
-	go func() {
-		defer close(unfinishedTasksChan)
-
-		workers.Parallel(entriesChan, unfinishedTasksChan, runtime.NumCPU(), func(entry os.DirEntry) UnfinishedTask {
-			if entry.IsDir() {
-				return UnfinishedTask{}
-			}
-
-			filename := entry.Name()
-			stepName := extractStepName(filename)
-			filePath := fmt.Sprintf("%s/%s", outputDir, filename)
-
-			var isCompleted bool
-
-			nextStep, err := db.GetStepByName(stepName)
-			if err != nil {
-				panic(err)
-			}
-			if nextStep != nil {
-				isCompleted, err = db.IsTaskCompletedInNextStep(nextStep.ID, t.ID)
-				if err != nil {
-					panic(err)
-				}
-
-				if isCompleted {
-					pipelineLogger.Verbosef("		Task %d already completed in next step", t.ID)
-					return UnfinishedTask{}
-				}
-			}
-
-			pipelineLogger.Verbosef("		Output: %s -> %s", filename, color.MagentaString(stepName))
-
-			hash, err := hashFileSHA256(filePath)
+		nextStep, err := db.GetStepByName(stepName)
+		if err != nil {
+			panic(err)
+		}
+		if nextStep != nil {
+			isCompleted, err = db.IsTaskCompletedInNextStep(nextStep.ID, t.ID)
 			if err != nil {
 				panic(err)
 			}
 
-			// Only set InputTaskID if current task has a valid DB ID
-			var inputTaskID *int64
-			if t.ID > 0 {
-				inputTaskID = &t.ID
-			}
-
-			pTask := Task{
-				ObjectHash:  hash,
-				InputTaskID: inputTaskID,
-				Processed:   isCompleted,
-				StepID:      &nextStep.ID,
-			}
-
-			return UnfinishedTask{pTask, nextStep, entry}
-		})
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		var buffer []UnfinishedTask
-		var bufferTasks []Task
-
-		for unfinishedTask := range unfinishedTasksChan {
-			buffer = append(buffer, unfinishedTask)
-			bufferTasks = append(bufferTasks, unfinishedTask.task)
-
-			if len(buffer) >= 100 {
-				completedTasks, err := db.BatchInsertTasks(bufferTasks)
-				if err != nil {
-					panic(err)
-				}
-
-				for i, cTask := range completedTasks {
-					uTask := buffer[i]
-					buffer[i].task = cTask
-					if uTask.step != nil {
-						p.tracker.ScheduleTask(unfinishedTask.step.Name)
-					}
-
-					filename := unfinishedTask.entry.Name()
-					filePath := fmt.Sprintf("%s/%s", outputDir, filename)
-
-					objectPath := db.GetObjectPath(unfinishedTask.task.ObjectHash)
-					_, err = copyFileWithSHA256(filePath, objectPath)
-					if err != nil {
-						panic(err)
-					}
-				}
+			if isCompleted {
+				pipelineLogger.Verbosef("    Task %d already completed in next step", t.ID)
+				return
 			}
 		}
-	}()
 
-	// Show what was scheduled
-	scheduledAfter := p.tracker.GetScheduledSummary()
-	newTasksScheduled := make(map[string]int64)
-	for stepName, count := range scheduledAfter {
-		if beforeCount, exists := scheduledBefore[stepName]; exists {
-			if count > beforeCount {
-				newTasksScheduled[stepName] = count - beforeCount
-			}
-		} else if count > 0 {
-			newTasksScheduled[stepName] = count
+		pipelineLogger.Verbosef("    Output: %s -> %s", filename, color.MagentaString(stepName))
+
+		hash, err := hashFileSHA256(filePath)
+		if err != nil {
+			panic(err)
 		}
-	}
 
-	wg.Wait()
+		// Only set InputTaskID if current task has a valid DB ID
+		var inputTaskID *int64
+		if t.ID > 0 {
+			inputTaskID = &t.ID
+		}
 
-	p.tracker.CompleteTask(t.ID, true)
+		pTask := Task{
+			ObjectHash:  hash,
+			InputTaskID: inputTaskID,
+			Processed:   isCompleted,
+		}
 
-	// Show scheduled tasks for this execution
-	if len(newTasksScheduled) > 0 && GetLogLevel() >= LogLevelNormal {
-		for stepName, count := range newTasksScheduled {
-			color.New(color.FgBlue).Fprintf(os.Stderr, "│   ")
-			color.New(color.FgCyan).Fprintf(os.Stderr, "+%d queued", count)
-			color.New(color.FgWhite).Fprintf(os.Stderr, " → %s\n", color.MagentaString(stepName))
+		if nextStep != nil {
+			pTask.StepID = &nextStep.ID
+		}
+		_, err = db.CreateTask(pTask)
+		if err != nil {
+			panic(err)
+		}
+
+		objectPath := db.GetObjectPath(hash)
+		_, err = copyFileWithSHA256(filePath, objectPath)
+		if err != nil {
+			panic(err)
 		}
 	}
 
@@ -362,8 +283,11 @@ func (p Pipeline) Seed() {
 	}
 }
 
-func (p Pipeline) ExecuteStep(s Step) int64 {
+func (p Pipeline) ExecuteStep(s Step, maxParallel int) int64 {
 	db := p.db
+
+	color.New(color.FgCyan, color.Bold).Fprintf(os.Stderr, "\n▶ ")
+	pipelineLogger.Printf("Step: %s", color.New(color.FgMagenta, color.Bold).Sprint(s.Name))
 
 	numberOfExecutions := int64(0)
 	numberOfUnprocessedTasks := int64(0)
@@ -376,33 +300,31 @@ func (p Pipeline) ExecuteStep(s Step) int64 {
 	}
 
 	if numberOfUnprocessedTasks == 0 {
-		if GetLogLevel() >= LogLevelVerbose {
-			color.New(color.FgBlue).Fprintf(os.Stderr, "│ ")
-			color.New(color.FgYellow).Fprintf(os.Stderr, "skipping")
-			color.New(color.FgWhite).Fprintf(os.Stderr, " %s (no pending tasks)\n", s.Name)
-		}
+		pipelineLogger.Verbosef("  No unprocessed tasks for step '%s'", s.Name)
 		return 0
 	}
 
-	// Start step tracking
-	p.tracker.StartStep(s.Name, numberOfUnprocessedTasks)
+	// Create progress bar
+	bar := NewProgressBar(numberOfUnprocessedTasks, fmt.Sprintf("  Processing %s", s.Name))
+
 
 	par := s.Parallel
 	if par == nil {
-		x := runtime.NumCPU()
-		par = &x
+		par = &maxParallel
 	}
-	workers.Parallel0(db.GetUnprocessedTasks(s.ID), int(*par), func(task Task) {
+	workers.Parallel0(db.GetUnprocessedTasks(s.ID), *par, func(task Task) {
 		if task.Processed {
 			return
 		}
 
 		p.ExecuteTask(task)
 		numberOfExecutions++
+		bar.Add(1)
 	})
 
-	p.tracker.FinishStep(true)
+	bar.Finish()
 
+	pipelineLogger.Successf("  Step '%s' complete: %d/%d tasks", s.Name, numberOfExecutions, numberOfUnprocessedTasks)
 	err := db.UpdateStepStatus(s.ID, true)
 	if err != nil {
 		panic(err)
