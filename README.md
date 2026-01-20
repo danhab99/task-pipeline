@@ -1,4 +1,6 @@
-# Task Pipeline
+# G.R.I.T
+
+> Go Runtime for Itterative Tasks
 
 A Go-based task pipeline system that executes shell scripts in a managed workflow with persistent state tracking.
 
