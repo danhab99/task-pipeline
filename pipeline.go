@@ -92,6 +92,18 @@ func (p Pipeline) ExecuteTask(t Task) {
 	}
 	defer os.RemoveAll(outputDir)
 
+	// Start watching output directory
+	watcher, err := NewOutputWatcher(db, t, &p)
+	if err != nil {
+		pipelineLogger.Errorf("    Failed to create watcher: %v", err)
+		panic(err)
+	}
+	if err := watcher.Start(outputDir); err != nil {
+		pipelineLogger.Errorf("    Failed to start watcher: %v", err)
+		panic(err)
+	}
+	defer watcher.Stop()
+
 	pipelineLogger.Verbosef("    Executing: %s", step.Script)
 	cmd := exec.Command("sh", "-c", step.Script)
 	cmd.Env = append(os.Environ(),
@@ -139,13 +151,11 @@ func (p Pipeline) ExecuteTask(t Task) {
 		pipelineLogger.Errorf("    Error executing script: %v", err)
 	}
 
-	// runtime.Breakpoint()
-	err = db.UpdateStepStatus(t.ID, true)
-	if err != nil {
-		panic(err)
-	}
+	// Stop watcher to ensure all files are processed
+	watcher.Stop()
 
-	entries, err := os.ReadDir(outputDir)
+	// runtime.Breakpoint()
+	err = db.UpdateTaskStatus(t.ID, true, nil)
 	if err != nil {
 		panic(err)
 	}
@@ -154,68 +164,6 @@ func (p Pipeline) ExecuteTask(t Task) {
 	if err != nil {
 		panic(err)
 	}
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			return
-		}
-
-		filename := entry.Name()
-		stepName := extractStepName(filename)
-		filePath := fmt.Sprintf("%s/%s", outputDir, filename)
-
-		var isCompleted bool
-
-		nextStep, err := db.GetStepByName(stepName)
-		if err != nil {
-			panic(err)
-		}
-		if nextStep != nil {
-			isCompleted, err = db.IsTaskCompletedInNextStep(nextStep.ID, t.ID)
-			if err != nil {
-				panic(err)
-			}
-
-			if isCompleted {
-				pipelineLogger.Verbosef("    Task %d already completed in next step", t.ID)
-				return
-			}
-		}
-
-		pipelineLogger.Verbosef("    Output: %s -> %s", filename, color.MagentaString(stepName))
-
-		hash, err := hashFileSHA256(filePath)
-		if err != nil {
-			panic(err)
-		}
-
-		// Only set InputTaskID if current task has a valid DB ID
-		var inputTaskID *int64
-		if t.ID > 0 {
-			inputTaskID = &t.ID
-		}
-
-		pTask := Task{
-			ObjectHash:  hash,
-			InputTaskID: inputTaskID,
-			Processed:   isCompleted,
-		}
-
-		if nextStep != nil {
-			pTask.StepID = &nextStep.ID
-		}
-		_, err = db.CreateTask(pTask)
-		if err != nil {
-			panic(err)
-		}
-
-		objectPath := db.GetObjectPath(hash)
-		_, err = copyFileWithSHA256(filePath, objectPath)
-		if err != nil {
-			panic(err)
-		}
-	}
-
 }
 
 // func (p Pipeline) IterateUnprocessed() chan Task {

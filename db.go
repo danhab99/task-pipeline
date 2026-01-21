@@ -152,7 +152,7 @@ func (d Database) CreateStep(step Step) (int64, error) {
 			s = 1
 		}
 
-		err := d.db.QueryRow("UPDATE step SET parallel = ?, is_start = ? WHERE id = ?", step.Parallel, s, existingID).Err()
+		_, err := d.db.Exec("UPDATE step SET parallel = ?, is_start = ? WHERE id = ?", step.Parallel, s, existingID)
 		if err != nil {
 			panic(err)
 		}
