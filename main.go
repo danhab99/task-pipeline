@@ -63,6 +63,9 @@ func main() {
 	}
 	mainLogger.Successf("Loaded %d steps from manifest", len(manifest.Steps))
 
+	// Check disk space before opening database
+	checkDiskSpace(*db_path)
+
 	mainLogger.Verbosef("Initializing database at: %s", *db_path)
 	database, err := NewDatabase(*db_path, *runset)
 	if err != nil {

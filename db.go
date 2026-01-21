@@ -97,7 +97,24 @@ func NewDatabase(repo_path string, runset string) (Database, error) {
 	}
 
 	dbLogger.Printf("Opening database at %s/db", repo_path)
-	db, err := sql.Open("sqlite3", fmt.Sprintf("%s/db", repo_path))
+	db, err := sql.Open("sqlite3", fmt.Sprintf("%s/db?timeout=600000", repo_path))
+	if err != nil {
+		return Database{}, err
+	}
+
+	// Set connection pool to reduce lock contention during checkpoint
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	// Force WAL checkpoint to clear the 173GB log before proceeding
+	dbLogger.Println("Checkpointing WAL file (this may take a moment)...")
+	_, err = db.Exec("PRAGMA busy_timeout = 600000;")
+	if err != nil {
+		return Database{}, err
+	}
+
+	// Checkpoint: restart to clear the wal file
+	_, err = db.Exec("PRAGMA wal_autocheckpoint = 0;")
 	if err != nil {
 		return Database{}, err
 	}
@@ -105,6 +122,12 @@ func NewDatabase(repo_path string, runset string) (Database, error) {
 	db.Exec("PRAGMA journal_mode=WAL;")
 	db.Exec("PRAGMA synchronous=NORMAL;")
 	db.Exec("PRAGMA foreign_keys=ON;")
+
+	// Force checkpoint
+	_, err = db.Exec("PRAGMA optimize;")
+	if err != nil {
+		dbLogger.Printf("Warning: PRAGMA optimize failed: %v", err)
+	}
 
 	dbLogger.Println("Initializing database schema")
 	_, err = db.Exec(schema)
@@ -128,7 +151,6 @@ func (d Database) CreateStep(step Step) (int64, error) {
 		if step.IsStart {
 			s = 1
 		}
-
 
 		err := d.db.QueryRow("UPDATE step SET parallel = ?, is_start = ? WHERE id = ?", step.Parallel, s, existingID).Err()
 		if err != nil {
@@ -749,4 +771,16 @@ func (d *Database) CreateAndGetTask(t Task) (*Task, error) {
 	}
 
 	return d.GetTask(taskId)
+}
+
+// ForceSaveWAL performs a WAL checkpoint to ensure data is persisted to the database file
+func (d Database) ForceSaveWAL() error {
+	dbLogger.Println("Checkpointing WAL...")
+	_, err := d.db.Exec("PRAGMA wal_checkpoint(RESTART);")
+	if err != nil {
+		dbLogger.Printf("Error checkpointing WAL: %v", err)
+		return err
+	}
+	dbLogger.Println("WAL checkpoint complete")
+	return nil
 }

@@ -280,6 +280,11 @@ func (p Pipeline) Seed() {
 func (p Pipeline) ExecuteStep(s Step, maxParallel int) int64 {
 	db := p.db
 
+	// Force save WAL before executing step
+	if err := db.ForceSaveWAL(); err != nil {
+		pipelineLogger.Warnf("Failed to checkpoint WAL before step '%s': %v", s.Name, err)
+	}
+
 	color.New(color.FgCyan, color.Bold).Fprintf(os.Stderr, "\n▶ ")
 	pipelineLogger.Printf("Step: %s", color.New(color.FgMagenta, color.Bold).Sprint(s.Name))
 

@@ -5,7 +5,25 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"syscall"
 )
+
+func checkDiskSpace(dbPath string) {
+	stat := syscall.Statfs_t{}
+	err := syscall.Statfs(dbPath, &stat)
+	if err != nil {
+		return // Silent fail if we can't check
+	}
+
+	availableGB := float64(stat.Bavail) * float64(stat.Bsize) / (1024 * 1024 * 1024)
+	totalGB := float64(stat.Blocks) * float64(stat.Bsize) / (1024 * 1024 * 1024)
+	usedGB := totalGB - availableGB
+	percentUsed := (usedGB / totalGB) * 100
+
+	if percentUsed > 85 {
+		mainLogger.Warnf("⚠️  Disk %s is %.1f%% full (%.1fGB free / %.1fGB total). This may cause database slowness.", dbPath, percentUsed, availableGB, totalGB)
+	}
+}
 
 func makeTempFile() (string, error) {
 	f, err := os.CreateTemp("/tmp", "*")
