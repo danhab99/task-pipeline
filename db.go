@@ -1,11 +1,13 @@
 package main
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
 	"os"
-	"time"
 
 	badger "github.com/dgraph-io/badger/v4"
 	_ "github.com/mattn/go-sqlite3"
@@ -374,6 +376,38 @@ func (d Database) GetTaintedSteps() chan Step {
 
 // Resource CRUD operations
 
+// CreateResourceFromReader reads data from an io.Reader, stores it in BadgerDB, and creates a resource record in SQLite.
+// Returns the resource ID and the calculated hash.
+func (d Database) CreateResourceFromReader(name string, reader io.Reader, stepID int64) (int64, string, error) {
+	// Read all data and calculate hash
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return 0, "", fmt.Errorf("failed to read data: %w", err)
+	}
+
+	// Calculate hash
+	hasher := sha256.New()
+	hasher.Write(data)
+	hashBytes := hasher.Sum(nil)
+	hash := hex.EncodeToString(hashBytes)
+
+	// Check if object already exists in BadgerDB
+	if !d.ObjectExists(hash) {
+		// Store in BadgerDB
+		if err := d.StoreObject(hash, data); err != nil {
+			return 0, "", fmt.Errorf("failed to store object: %w", err)
+		}
+	}
+
+	// Create resource record in SQLite
+	resourceID, err := d.CreateResource(name, hash, stepID)
+	if err != nil {
+		return 0, "", fmt.Errorf("failed to create resource record: %w", err)
+	}
+
+	return resourceID, hash, nil
+}
+
 func (d Database) CreateResource(name string, objectHash string, stepID int64) (int64, error) {
 	// First check if the resource already exists
 	var existingID int64
@@ -639,12 +673,12 @@ func (d Database) CreateTasksFromResources(stepID int64, resourceIDs []int64) ([
 		if err != nil {
 			return nil, err
 		}
-		
+
 		id, err := res.LastInsertId()
 		if err != nil {
 			return nil, err
 		}
-		
+
 		// If LastInsertId is 0, the insert was ignored (duplicate)
 		if id > 0 {
 			taskIDs = append(taskIDs, id)
@@ -1039,23 +1073,6 @@ func (d Database) ObjectExists(hash string) bool {
 		return err
 	})
 	return err == nil
-}
-
-func (d Database) GetObjectPath(hash string) string {
-	dir := fmt.Sprintf(
-		"%s/objects/%s/%s/%s",
-		d.repo_path, hash[0:2], hash[2:4], hash[4:6],
-	)
-
-	for {
-		err := os.MkdirAll(dir, 0755)
-		if err == nil {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	return fmt.Sprintf("%s/%s", dir, hash[6:])
 }
 
 func (d *Database) CreateAndGetTask(t Task) (*Task, error) {
