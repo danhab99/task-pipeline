@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
+	badger "github.com/dgraph-io/badger/v4"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -58,6 +60,7 @@ type Database struct {
 	db        *sql.DB
 	repo_path string
 	runset    string
+	badgerDB  *badger.DB
 }
 
 type Step struct {
@@ -141,7 +144,31 @@ func NewDatabase(repo_path string, runset string) (Database, error) {
 		return Database{}, err
 	}
 
-	return Database{db, repo_path, runset}, nil
+	// Initialize BadgerDB for object storage
+	badgerPath := fmt.Sprintf("%s/objects_db", repo_path)
+	dbLogger.Printf("Opening BadgerDB at %s", badgerPath)
+	badgerOpts := badger.DefaultOptions(badgerPath)
+	badgerOpts.Logger = nil // Disable BadgerDB's default logging
+
+	// Performance tuning for sequential batch operations
+	// Objects are written in batches during output processing, then read sequentially during task execution
+	badgerOpts.SyncWrites = false           // Don't fsync on every write
+	badgerOpts.NumVersionsToKeep = 1        // No version history for immutable data
+	badgerOpts.CompactL0OnClose = false     // Faster shutdown
+	badgerOpts.ValueLogFileSize = 512 << 20 // Larger value log (512MB) for batch writes
+	badgerOpts.MemTableSize = 128 << 20     // Large memtable (128MB) for batch buffering
+	badgerOpts.NumMemtables = 3             // More memtables for write-heavy batches
+	badgerOpts.NumLevelZeroTables = 5       // Allow more L0 tables before compaction
+	badgerOpts.NumLevelZeroTablesStall = 10 // Higher stall threshold
+	badgerOpts.ValueThreshold = 1024        // Store larger values in value log for sequential read
+	badgerOpts.NumCompactors = 2            // More compactors for background work
+
+	badgerDB, err := badger.Open(badgerOpts)
+	if err != nil {
+		return Database{}, fmt.Errorf("failed to open BadgerDB: %w", err)
+	}
+
+	return Database{db, repo_path, runset, badgerDB}, nil
 }
 
 // Step CRUD operations
