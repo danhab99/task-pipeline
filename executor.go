@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"sync"
@@ -14,16 +13,26 @@ import (
 type ScriptExecutor struct {
 	db       *Database
 	pipeline *Pipeline
+	tempDir  string
 }
 
 func NewScriptExecutor(db *Database, pipeline *Pipeline) *ScriptExecutor {
+
+	tempDir, err := os.MkdirTemp("/tmp", "output-*")
+	if err != nil {
+		panic(err)
+	}
+
 	return &ScriptExecutor{
 		db:       db,
 		pipeline: pipeline,
+		tempDir:  tempDir,
 	}
 }
 
 func (e *ScriptExecutor) Execute(task Task, step Step) error {
+	pipelineLogger.Verbosef("    Executing task ID=%d for step '%s' (step_id=%d)", task.ID, step.Name, task.StepID)
+
 	// Create input file
 	inputFile, err := os.CreateTemp("/tmp", "input-*")
 	if err != nil {
@@ -44,13 +53,6 @@ func (e *ScriptExecutor) Execute(task Task, step Step) error {
 	}
 	defer os.RemoveAll(outputDir)
 
-	// Start output watcher
-	watcher, err := e.setupWatcher(task, outputDir)
-	if err != nil {
-		return err
-	}
-	defer watcher.Stop()
-
 	// Execute the script
 	pipelineLogger.Verbosef("    Executing: %s", step.Script)
 	cmd := e.buildCommand(step, inputFile.Name(), outputDir)
@@ -60,46 +62,32 @@ func (e *ScriptExecutor) Execute(task Task, step Step) error {
 		return err
 	}
 
-	// Stop watcher to ensure all files are processed
-	watcher.Stop()
-
 	return nil
 }
 
 func (e *ScriptExecutor) prepareInput(task Task, inputFile *os.File) error {
-	if task.ObjectHash != "" {
-		objectPath := e.db.GetObjectPath(task.ObjectHash)
-		data, err := os.Open(objectPath)
+	// Get input resource if task has one
+	if task.InputResourceID != nil {
+		inputResource, err := e.db.GetResource(*task.InputResourceID)
 		if err != nil {
-			return fmt.Errorf("failed to open object: %w", err)
+			return fmt.Errorf("failed to get input resource: %w", err)
 		}
-		defer data.Close()
 
-		n, err := io.Copy(inputFile, data)
+		data, err := e.db.GetObject(inputResource.ObjectHash)
 		if err != nil {
-			return fmt.Errorf("failed to copy input data: %w", err)
+			return fmt.Errorf("failed to get object: %w", err)
 		}
-		pipelineLogger.Verbosef("    Input: %d bytes from %s", n, task.ObjectHash[:16]+"...")
+
+		n, err := inputFile.Write(data)
+		if err != nil {
+			return fmt.Errorf("failed to write input data: %w", err)
+		}
+		pipelineLogger.Verbosef("    Input: %d bytes from resource '%s' (hash: %s)", n, inputResource.Name, inputResource.ObjectHash[:16]+"...")
 	} else {
 		pipelineLogger.Verbosef("    Input: (empty - start step)")
 	}
 
 	return nil
-}
-
-func (e *ScriptExecutor) setupWatcher(task Task, outputDir string) (*OutputWatcher, error) {
-	watcher, err := NewOutputWatcher(e.db, task, e.pipeline)
-	if err != nil {
-		pipelineLogger.Errorf("    Failed to create watcher: %v", err)
-		return nil, fmt.Errorf("failed to create watcher: %w", err)
-	}
-
-	if err := watcher.Start(outputDir); err != nil {
-		pipelineLogger.Errorf("    Failed to start watcher: %v", err)
-		return nil, fmt.Errorf("failed to start watcher: %w", err)
-	}
-
-	return watcher, nil
 }
 
 func (e *ScriptExecutor) buildCommand(step Step, inputFile, outputDir string) *exec.Cmd {

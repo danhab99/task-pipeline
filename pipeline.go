@@ -15,13 +15,109 @@ import (
 type Pipeline struct {
 	db           *Database
 	enabledSteps []Step
+	stepInputs   map[int64][]string // step_id -> list of input resource names
+	fuseWatcher  *FuseWatcher
+	fuseOutputs  chan FileData
 }
 
-func NewPipeline(d *Database, steps []Step) Pipeline {
-	return Pipeline{d, steps}
+func NewPipeline(d *Database, steps []Step, stepInputs map[int64][]string) (*Pipeline, error) {
+	// Create output channel for FUSE (buffered for backpressure control)
+	fuseOutputs := make(chan FileData, 10)
+
+	// Create single FUSE server for all tasks
+	fuseWatcher, err := NewTempDirFuseWatcher(fuseOutputs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create FUSE watcher: %w", err)
+	}
+
+	fuseWatcher.Start()
+	pipelineLogger.Printf("FUSE server started at: %s", fuseWatcher.mountPath)
+
+	p := &Pipeline{
+		db:           d,
+		enabledSteps: steps,
+		stepInputs:   stepInputs,
+		fuseWatcher:  fuseWatcher,
+		fuseOutputs:  fuseOutputs,
+	}
+
+	// Start goroutine to process FUSE outputs
+	go p.processFuseOutputs()
+
+	return p, nil
 }
 
 var pipelineLogger = NewColorLogger("[PIPELINE] ", color.New(color.FgCyan, color.Bold))
+
+func (p *Pipeline) processFuseOutputs() {
+	for fileData := range p.fuseOutputs {
+		// Extract step name from filename
+		stepName := extractStepName(fileData.Name)
+
+		// Get the next step
+		nextStep, err := p.db.GetStepByName(stepName)
+		if err != nil {
+			pipelineLogger.Errorf("Failed to get next step %s: %v", stepName, err)
+			continue
+		}
+		if nextStep == nil {
+			pipelineLogger.Warnf("No step found for name: %s", stepName)
+			continue
+		}
+
+		// Create resource from file content (blocks on database write - backpressure!)
+		resourceID, hash, err := p.db.CreateResourceFromReader(fileData.Name, fileData.Reader, nextStep.ID)
+		if err != nil {
+			pipelineLogger.Errorf("Failed to create resource: %v", err)
+			continue
+		}
+
+		pipelineLogger.Verbosef("Output: %s -> %s (hash: %s)", fileData.Name, color.MagentaString(stepName), hash[:16]+"...")
+
+		// Create task for the next step
+		newTask := Task{
+			StepID:          nextStep.ID,
+			InputResourceID: &resourceID,
+			Processed:       false,
+		}
+
+		_, err = p.db.CreateTask(newTask)
+		if err != nil {
+			pipelineLogger.Errorf("Failed to create task: %v", err)
+			continue
+		}
+
+		pipelineLogger.Verbosef("Created task for %s in step %s", hash[:16]+"...", stepName)
+	}
+}
+
+func (p *Pipeline) Stop() error {
+	if p.fuseWatcher != nil {
+		pipelineLogger.Printf("Stopping FUSE server...")
+		if err := p.fuseWatcher.Stop(); err != nil {
+			return err
+		}
+		close(p.fuseOutputs)
+	}
+	return nil
+}
+
+func (p *Pipeline) GetStepsByInputName(resourceName string) []int64 {
+	pipelineLogger.Verbosef("Looking up steps for resource name: '%s'", resourceName)
+	pipelineLogger.Verbosef("Available stepInputs map: %+v", p.stepInputs)
+	var stepIDs []int64
+	for stepID, inputs := range p.stepInputs {
+		for _, inputName := range inputs {
+			if inputName == resourceName {
+				pipelineLogger.Verbosef("  Found match: step %d consumes '%s'", stepID, resourceName)
+				stepIDs = append(stepIDs, stepID)
+				break
+			}
+		}
+	}
+	pipelineLogger.Verbosef("  Found %d steps that consume '%s'", len(stepIDs), resourceName)
+	return stepIDs
+}
 
 func (p *Pipeline) Execute(startStepName string, maxParallel int) int64 {
 	db := p.db
@@ -53,7 +149,7 @@ func (p *Pipeline) Execute(startStepName string, maxParallel int) int64 {
 func (p Pipeline) ExecuteTask(t Task) {
 	db := p.db
 
-	step, err := db.GetStep(*t.StepID)
+	step, err := db.GetStep(t.StepID)
 	if err != nil {
 		panic(err)
 	}
@@ -97,7 +193,7 @@ func (p Pipeline) Seed() {
 	if seedTask == nil {
 		// No unprocessed tasks, create a new one
 		prestartTask := Task{
-			StepID: &startStep.ID,
+			StepID: startStep.ID,
 		}
 
 		startTaskId, err := db.CreateTask(prestartTask)
@@ -186,6 +282,7 @@ func (p Pipeline) ExecuteStep(s Step, maxParallel int) int64 {
 		numberOfExecutions++
 
 		mu.Lock()
+		defer mu.Unlock()
 		completedCount++
 		elapsed := time.Since(lastPrint)
 		// Print progress update every 2 seconds or every 100 tasks
@@ -193,7 +290,6 @@ func (p Pipeline) ExecuteStep(s Step, maxParallel int) int64 {
 			pipelineLogger.Printf("  %s: %d/%d tasks completed", s.Name, completedCount, numberOfUnprocessedTasks)
 			lastPrint = time.Now()
 		}
-		mu.Unlock()
 	})
 
 	// Print final status

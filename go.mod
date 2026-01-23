@@ -3,10 +3,12 @@ module task-pipeline
 go 1.24.4
 
 require (
+	github.com/alecthomas/chroma v0.10.0
 	github.com/danhab99/idk v0.0.0-20240602050216-30f411277e45
 	github.com/dgraph-io/badger/v4 v4.9.0
 	github.com/fatih/color v1.18.0
 	github.com/fsnotify/fsnotify v1.9.0
+	github.com/hanwen/go-fuse/v2 v2.9.0
 	github.com/mattn/go-sqlite3 v1.14.33
 	github.com/pelletier/go-toml v1.9.5
 	github.com/schollz/progressbar/v3 v3.19.0
@@ -15,6 +17,7 @@ require (
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dgraph-io/ristretto/v2 v2.2.0 // indirect
+	github.com/dlclark/regexp2 v1.4.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
