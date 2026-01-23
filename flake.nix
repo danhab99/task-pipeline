@@ -46,6 +46,7 @@
             echo "Available commands:"
             echo "  go build      - Build the project"
             echo "  go test       - Run tests"
+            echo "  go mod vendor - Update vendors for nix"
             echo "  dlv debug     - Debug with Delve"
             export OUTPUT_DIR=$(mktemp -d)
           '';
