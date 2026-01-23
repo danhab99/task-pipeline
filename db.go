@@ -966,7 +966,6 @@ func (d Database) GetUnprocessedTasks(stepID int64) chan Task {
 		var taskCount int64 = 0
 		defer func() {
 			dbLogger.Printf("GetUnprocessedTasks(step=%d) found %d unprocessed tasks", stepID, taskCount)
-			fmt.Printf("!!!! CLOSING\n")
 		}()
 
 		// Get all unprocessed tasks for this step

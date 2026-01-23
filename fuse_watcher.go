@@ -3,6 +3,7 @@ package main
 import (
 	"io"
 	"io/fs"
+	"log"
 	"os"
 	"sync"
 	"time"
@@ -21,6 +22,7 @@ type FuseWatcher struct {
 	files      map[string]*fileData
 	closed     bool
 	outputChan chan<- FileData
+	openFiles  sync.WaitGroup // Track open files
 }
 
 // FileData contains the filename and content of a file written to the FUSE mount
@@ -34,7 +36,7 @@ type fileData struct {
 	mu      sync.Mutex
 }
 
-var fuseLogger := log.New(os.Stderr, "[FUSE]", LOG_FLAGS)
+var fuseLogger = log.New(os.Stderr, "[FUSE]", LOG_FLAGS)
 
 // NewFuseWatcher creates a new FUSE watcher that mounts at the specified path
 // Backpressure is controlled by the capacity of outputChan
@@ -50,7 +52,10 @@ func NewFuseWatcher(mountPath string, outputChan chan<- FileData) (*FuseWatcher,
 		outputChan: outputChan,
 	}
 
-	fs := pathfs.NewPathNodeFs(&fuseFS{watcher: fw}, nil)
+	fs := pathfs.NewPathNodeFs(&fuseFS{
+		FileSystem: pathfs.NewDefaultFileSystem(),
+		watcher:    fw,
+	}, nil)
 	server, _, err := nodefs.MountRoot(mountPath, fs.Root(), &nodefs.Options{
 		AttrTimeout:  time.Second,
 		EntryTimeout: time.Second,
@@ -83,7 +88,12 @@ func (fw *FuseWatcher) Start() {
 	go fw.server.Serve()
 }
 
-// Stop unmounts the filesystem and closes the entries channel
+// WaitForWrites blocks until all open files have been closed
+func (fw *FuseWatcher) WaitForWrites() {
+	fw.openFiles.Wait()
+}
+
+// Stop unmounts the filesystem, waits for all files to be released, and closes the entries channel
 func (fw *FuseWatcher) Stop() error {
 	fw.mu.Lock()
 	if fw.closed {
@@ -92,6 +102,11 @@ func (fw *FuseWatcher) Stop() error {
 	}
 	fw.closed = true
 	fw.mu.Unlock()
+
+	// Wait for all open files to be released
+	fuseLogger.Println("Waiting for all open files to be released...")
+	fw.openFiles.Wait()
+	fuseLogger.Println("All files released")
 
 	err := fw.server.Unmount()
 	close(fw.entries)
@@ -144,10 +159,12 @@ func (fs *fuseFS) Create(name string, flags uint32, mode uint32, context *fuse.C
 
 	fd := &fileData{content: make([]byte, 0)}
 	fs.watcher.files[name] = fd
+	fs.watcher.openFiles.Add(1) // Track this open file
 
 	fuseLogger.Printf("create %s flags=%d mode=%d\n", name, flags, mode)
 
 	return &fuseFile{
+		File:    nodefs.NewDefaultFile(),
 		name:    name,
 		data:    fd,
 		watcher: fs.watcher,
@@ -225,6 +242,9 @@ func (f *fuseFile) Release() {
 	f.watcher.mu.Lock()
 	delete(f.watcher.files, f.name)
 	f.watcher.mu.Unlock()
+	
+	// Signal that this file is closed
+	f.watcher.openFiles.Done()
 }
 
 // fuseDirEntry implements fs.DirEntry

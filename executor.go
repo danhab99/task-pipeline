@@ -13,25 +13,19 @@ import (
 type ScriptExecutor struct {
 	db       *Database
 	pipeline *Pipeline
-	tempDir  string
+	outputDir string
 }
 
-func NewScriptExecutor(db *Database, pipeline *Pipeline) *ScriptExecutor {
-
-	tempDir, err := os.MkdirTemp("/tmp", "output-*")
-	if err != nil {
-		panic(err)
-	}
-
+func NewScriptExecutor(db *Database, pipeline *Pipeline, outputDir string) *ScriptExecutor {
 	return &ScriptExecutor{
 		db:       db,
 		pipeline: pipeline,
-		tempDir:  tempDir,
+		outputDir: outputDir,
 	}
 }
 
 func (e *ScriptExecutor) Execute(task Task, step Step) error {
-	pipelineLogger.Verbosef("    Executing task ID=%d for step '%s' (step_id=%d)", task.ID, step.Name, task.StepID)
+	pipelineLogger.Printf("    Executing task ID=%d for step '%s' (step_id=%d)", task.ID, step.Name, task.StepID)
 
 	// Create input file
 	inputFile, err := os.CreateTemp("/tmp", "input-*")
@@ -46,16 +40,9 @@ func (e *ScriptExecutor) Execute(task Task, step Step) error {
 	}
 	inputFile.Close()
 
-	// Create output directory
-	outputDir, err := os.MkdirTemp("/tmp", "output-*")
-	if err != nil {
-		return fmt.Errorf("failed to create output directory: %w", err)
-	}
-	defer os.RemoveAll(outputDir)
-
 	// Execute the script
-	pipelineLogger.Verbosef("    Executing: %s", step.Script)
-	cmd := e.buildCommand(step, inputFile.Name(), outputDir)
+	pipelineLogger.Printf("    Executing: %s", step.Script)
+	cmd := e.buildCommand(step, inputFile.Name(), e.outputDir)
 
 	// Run script and capture output
 	if err := e.runScript(cmd, step); err != nil {
@@ -82,9 +69,9 @@ func (e *ScriptExecutor) prepareInput(task Task, inputFile *os.File) error {
 		if err != nil {
 			return fmt.Errorf("failed to write input data: %w", err)
 		}
-		pipelineLogger.Verbosef("    Input: %d bytes from resource '%s' (hash: %s)", n, inputResource.Name, inputResource.ObjectHash[:16]+"...")
+		pipelineLogger.Printf("    Input: %d bytes from resource '%s' (hash: %s)", n, inputResource.Name, inputResource.ObjectHash[:16]+"...")
 	} else {
-		pipelineLogger.Verbosef("    Input: (empty - start step)")
+		pipelineLogger.Printf("    Input: (empty - start step)")
 	}
 
 	return nil
@@ -111,7 +98,7 @@ func (e *ScriptExecutor) runScript(cmd *exec.Cmd, step Step) error {
 	}
 
 	if err := cmd.Start(); err != nil {
-		pipelineLogger.Errorf("    Error starting script: %v", err)
+		pipelineLogger.Printf("    Error starting script: %v", err)
 		return fmt.Errorf("failed to start script: %w", err)
 	}
 
@@ -132,16 +119,21 @@ func (e *ScriptExecutor) runScript(cmd *exec.Cmd, step Step) error {
 		defer wg.Done()
 		scanner := bufio.NewScanner(stderrPipe)
 		for scanner.Scan() {
-			scriptLogger.Verbosef("[stderr] %s", scanner.Text())
+			scriptLogger.Printf("[stderr] %s", scanner.Text())
 		}
 	}()
 
 	wg.Wait()
 
 	if err := cmd.Wait(); err != nil {
-		pipelineLogger.Errorf("    Error executing script: %v", err)
+		pipelineLogger.Printf("    Error executing script: %v", err)
 		return fmt.Errorf("script execution failed: %w", err)
 	}
 
+	return nil
+}
+
+func (e *ScriptExecutor) setupFUSEWatcher(cmd *exec.Cmd, step Step) error {
+	// TODO: Implement FUSE-based watcher if needed
 	return nil
 }
