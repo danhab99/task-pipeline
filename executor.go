@@ -13,14 +13,12 @@ import (
 type ScriptExecutor struct {
 	db        *Database
 	pipeline  *Pipeline
-	outputDir string
 }
 
-func NewScriptExecutor(db *Database, pipeline *Pipeline, outputDir string) *ScriptExecutor {
+func NewScriptExecutor(db *Database, pipeline *Pipeline) *ScriptExecutor {
 	return &ScriptExecutor{
 		db:        db,
 		pipeline:  pipeline,
-		outputDir: outputDir,
 	}
 }
 
@@ -42,7 +40,7 @@ func (e *ScriptExecutor) Execute(task Task, step Step) error {
 
 	// Execute the script
 	pipelineLogger.Printf("    Executing: %s", step.Script)
-	cmd := e.buildCommand(step, inputFile.Name(), e.outputDir)
+	cmd := e.buildCommand(step, inputFile.Name(), e.pipeline.GetFusePath())
 
 	// Run script and capture output
 	if err := e.runScript(cmd, step); err != nil {
