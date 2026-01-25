@@ -47,6 +47,8 @@ func NewFuseWatcher(mountPath string, outputChan chan<- FileData) (*FuseWatcher,
 		return nil, err
 	}
 
+	fuseLogger.Println("New FUSE watcher at", mountPath)
+
 	fw := &FuseWatcher{
 		mountPath:  mountPath,
 		entries:    make(chan fs.DirEntry, 100),
@@ -86,8 +88,13 @@ func (fw *FuseWatcher) Entries() <-chan fs.DirEntry {
 
 // Start begins serving the FUSE filesystem
 func (fw *FuseWatcher) Start() {
-	fuseLogger.Println("Starting server")
+	fuseLogger.Printf("Starting server at %s", fw.mountPath)
 	go fw.server.Serve()
+}
+
+// GetMountPath returns the mount path for this FUSE watcher
+func (fw *FuseWatcher) GetMountPath() string {
+	return fw.mountPath
 }
 
 // WaitForWrites blocks until all open files have been closed
@@ -95,7 +102,7 @@ func (fw *FuseWatcher) WaitForWrites() {
 	fw.openFiles.Wait()
 }
 
-// Stop unmounts the filesystem, waits for all files to be released, and closes the entries channel
+// Stop unmounts the filesystem, waits for all files to be released, closes channels, and cleans up the mount directory
 func (fw *FuseWatcher) Stop() error {
 	fw.mu.Lock()
 	if fw.closed {
@@ -105,43 +112,84 @@ func (fw *FuseWatcher) Stop() error {
 	fw.closed = true
 	fw.mu.Unlock()
 
-	// Force process all buffered files immediately
-	initialCount := fw.openFilesCount.Load()
-	if initialCount > 0 {
-		fuseLogger.Printf("Force processing %d files still in buffer\n", initialCount)
-		
-		fw.mu.Lock()
-		// Copy the files map
-		filesToProcess := make(map[string]*fileData)
-		for name, data := range fw.files {
-			filesToProcess[name] = data
+	fuseLogger.Printf("Stopping server at %s", fw.mountPath)
+
+	// Wait for any open files to be closed (with timeout)
+	done := make(chan struct{})
+	go func() {
+		fw.openFiles.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// All files closed normally
+		fuseLogger.Printf("All files closed gracefully")
+	case <-time.After(2 * time.Second):
+		// Timeout - force process remaining files
+		remaining := fw.openFilesCount.Load()
+		if remaining > 0 {
+			fuseLogger.Printf("Timeout waiting for %d open files, force processing", remaining)
+			fw.forceProcessFiles()
 		}
-		fw.mu.Unlock()
-		
-		// Process each buffered file
-		for name, data := range filesToProcess {
-			data.mu.Lock()
-			if len(data.content) > 0 {
-				content := make([]byte, len(data.content))
-				copy(content, data.content)
-				data.mu.Unlock()
-				
-				// Send to output channel
-				if fw.outputChan != nil {
-					reader := &bytesReader{data: content}
-					fw.outputChan <- FileData{Name: name, Reader: reader}
-				}
-			} else {
-				data.mu.Unlock()
-			}
-		}
-		fuseLogger.Printf("Finished force processing %d files\n", len(filesToProcess))
 	}
 
+	// Unmount the filesystem
 	err := fw.server.Unmount()
+	if err != nil {
+		fuseLogger.Printf("Error unmounting: %v", err)
+	}
+
+	// Close channels
 	close(fw.entries)
-	fuseLogger.Println("Stopping server")
-	return err
+
+	// Clean up the mount directory
+	if err := os.RemoveAll(fw.mountPath); err != nil {
+		fuseLogger.Printf("Error removing mount directory %s: %v", fw.mountPath, err)
+		return err
+	}
+
+	fuseLogger.Printf("Cleaned up mount directory %s", fw.mountPath)
+	return nil
+}
+
+// forceProcessFiles processes any files still in the buffer
+func (fw *FuseWatcher) forceProcessFiles() {
+	fw.mu.Lock()
+	// Copy the files map
+	filesToProcess := make(map[string]*fileData)
+	for name, data := range fw.files {
+		filesToProcess[name] = data
+	}
+	fw.mu.Unlock()
+
+	// Process each buffered file
+	for name, data := range filesToProcess {
+		data.mu.Lock()
+		if len(data.content) > 0 {
+			content := make([]byte, len(data.content))
+			copy(content, data.content)
+			data.mu.Unlock()
+
+			// Send to output channel if available
+			if fw.outputChan != nil {
+				reader := &bytesReader{data: content}
+				select {
+				case fw.outputChan <- FileData{Name: name, Reader: reader}:
+					fuseLogger.Printf("Force-processed file: %s", name)
+				case <-time.After(1 * time.Second):
+					fuseLogger.Printf("Timeout sending file %s to channel", name)
+				}
+			}
+		} else {
+			data.mu.Unlock()
+		}
+	}
+
+	// Clear the files map
+	fw.mu.Lock()
+	fw.files = make(map[string]*fileData)
+	fw.mu.Unlock()
 }
 
 // fuseFS implements the FUSE filesystem interface
@@ -252,17 +300,11 @@ func (f *fuseFile) Release() {
 	f.data.mu.Unlock()
 
 	if len(content) > 0 {
-		// Send directory entry through channel
-		entry := &fuseDirEntry{name: f.name}
-
 		f.watcher.mu.Lock()
 		closed := f.watcher.closed
 		f.watcher.mu.Unlock()
 
 		if !closed {
-			// Block until we can send (provides backpressure)
-			f.watcher.entries <- entry
-
 			// Send file data to output channel - blocks until consumed
 			if f.watcher.outputChan != nil {
 				reader := &bytesReader{data: content}

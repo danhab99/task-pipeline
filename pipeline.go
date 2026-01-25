@@ -3,6 +3,10 @@ package main
 import (
 	"log"
 	"os"
+	"runtime"
+	"sync/atomic"
+
+	"github.com/danhab99/idk/workers"
 )
 
 var pipelineLogger = log.New(os.Stderr, "[PIPELINE] ", log.Ldate|log.Ltime|log.Lmsgprefix)
@@ -10,6 +14,7 @@ var pipelineLogger = log.New(os.Stderr, "[PIPELINE] ", log.Ldate|log.Ltime|log.L
 type Pipeline struct {
 	db          *Database
 	fuseWatcher *FuseWatcher
+	outputChan  chan FileData
 }
 
 func NewPipeline(db *Database) (*Pipeline, error) {
@@ -18,19 +23,7 @@ func NewPipeline(db *Database) (*Pipeline, error) {
 		return nil, err
 	}
 
-	outputChan := make(chan FileData)
-
-	// Single FUSE server collects all resources
-	go func() {
-		for data := range outputChan {
-			_, hash, err := db.CreateResourceFromReader(data.Name, data.Reader)
-			if err != nil {
-				pipelineLogger.Printf("Error creating resource %s: %v", data.Name, err)
-				continue
-			}
-			pipelineLogger.Printf("Created resource %s (hash: %s)", data.Name, hash[:16]+"...")
-		}
-	}()
+	outputChan := db.MakeResourceConsumer()
 
 	fuseWatcher, err := NewFuseWatcher(outDir, outputChan)
 	if err != nil {
@@ -40,6 +33,7 @@ func NewPipeline(db *Database) (*Pipeline, error) {
 	return &Pipeline{
 		db:          db,
 		fuseWatcher: fuseWatcher,
+		outputChan:  outputChan,
 	}, nil
 }
 
@@ -61,11 +55,16 @@ func (p *Pipeline) ExecuteStep(step Step, maxParallel int) int64 {
 	executor := NewScriptExecutor(db, p)
 	taskChan := db.GetUnprocessedTasks(step.ID)
 
-	var executionCount int64
-	for task := range taskChan {
+	var executionCount atomic.Int64
+	pr := step.Parallel
+	if pr == nil {
+		x := runtime.NumCPU()
+		pr = &x
+	}
+	workers.Parallel0(taskChan, *pr, func(task Task) {
 		pipelineLogger.Printf("Executing task %d for step %s", task.ID, step.Name)
 
-		execErr := executor.Execute(task, step)
+		execErr := executor.Execute(task, step, p.outputChan)
 
 		var errorMsg *string
 		if execErr != nil {
@@ -79,10 +78,10 @@ func (p *Pipeline) ExecuteStep(step Step, maxParallel int) int64 {
 			pipelineLogger.Printf("Error updating task %d: %v", task.ID, err)
 		}
 
-		executionCount++
-	}
+		executionCount.Add(1)
+	})
 
-	return executionCount
+	return executionCount.Load()
 }
 
 func (p *Pipeline) GetFusePath() string {

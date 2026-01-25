@@ -11,18 +11,21 @@ import (
 )
 
 type ScriptExecutor struct {
-	db        *Database
-	pipeline  *Pipeline
+	db       *Database
+	pipeline *Pipeline
 }
 
 func NewScriptExecutor(db *Database, pipeline *Pipeline) *ScriptExecutor {
 	return &ScriptExecutor{
-		db:        db,
-		pipeline:  pipeline,
+		db:       db,
+		pipeline: pipeline,
 	}
 }
 
-func (e *ScriptExecutor) Execute(task Task, step Step) error {
+func (e *ScriptExecutor) Execute(task Task, step Step, outputChan chan FileData) error {
+	watcher, err := NewFuseWatcher(mkTemp(), outputChan)
+	defer watcher.WaitForWrites()
+
 	pipelineLogger.Printf("    Executing task ID=%d for step '%s' (step_id=%d)", task.ID, step.Name, task.StepID)
 
 	// Create input file
@@ -40,7 +43,7 @@ func (e *ScriptExecutor) Execute(task Task, step Step) error {
 
 	// Execute the script
 	pipelineLogger.Printf("    Executing: %s", step.Script)
-	cmd := e.buildCommand(step, inputFile.Name(), e.pipeline.GetFusePath())
+	cmd := e.buildCommand(step, inputFile.Name(), watcher.mountPath)
 
 	// Run script and capture output
 	if err := e.runScript(cmd, step); err != nil {
@@ -121,9 +124,13 @@ func (e *ScriptExecutor) runScript(cmd *exec.Cmd, step Step) error {
 		}
 	}()
 
+	// Wait for command to finish (closes pipes)
+	err = cmd.Wait()
+
+	// Then wait for goroutines to finish reading
 	wg.Wait()
 
-	if err := cmd.Wait(); err != nil {
+	if err != nil {
 		pipelineLogger.Printf("    Error executing script: %v", err)
 		return fmt.Errorf("script execution failed: %w", err)
 	}
