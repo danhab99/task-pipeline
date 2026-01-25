@@ -4,6 +4,32 @@
 
 A Go-based task pipeline system that executes shell scripts in a managed workflow with persistent state tracking.
 
+```
+     ┌─────────────┐
+     │   Manifest  │
+     └──────┬──────┘
+            │
+            ▼
+     ┌─────────────┐     ┌──────────────┐
+     │  Register   │────▶│   Database   │
+     │    Steps    │     │  (SQLite +   │
+     └──────┬──────┘     │   BadgerDB)  │
+            │            └──────────────┘
+            ▼
+     ┌─────────────────────────┐
+     │  Single FUSE Server     │◀──── All task outputs
+     │  (collects resources)   │
+     └─────────────────────────┘
+            │
+            ▼
+     ┌─────────────────────────┐
+     │  For each step:         │
+     │  1. Schedule tasks      │
+     │  2. Execute tasks       │
+     │  3. Return count        │
+     └─────────────────────────┘
+```
+
 ## Quick Start
 
 ### Using Nix Flakes
