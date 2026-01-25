@@ -557,17 +557,17 @@ tr '[:lower:]' '[:upper:]' < $INPUT_FILE | rev > $OUTPUT_DIR/processed
 
 ## Output
 
-The program provides logging based on the log level flag:
+The program provides three logging modes controlled by command-line flags:
 
-### Normal Mode Output (default)
+### Normal Mode (default)
 - Manifest loading and step count
 - Database initialization (SQLite + BadgerDB)
-- Step execution with colored indicators
-- Task execution information
-- Resource creation notifications
+- Step execution with colored log prefixes
+- Task execution messages (ID, step name, input/output details)
+- Resource creation notifications with hashes
 - Execution summary with total duration
 
-### Verbose Mode Output (`-verbose`)
+### Verbose Mode (`-verbose` flag)
 Everything in Normal mode plus:
 - Step registration details with version info
 - Database operation details (task scheduling, resource lookups)
@@ -577,7 +577,7 @@ Everything in Normal mode plus:
 - Individual task processing information
 - FUSE mount/unmount operations
 
-### Quiet Mode Output (`-quiet`)
+### Quiet Mode (`-quiet` flag)
 - Only critical errors and failures
 - No progress indicators or status updates
 - Suitable for CI/CD and automated environments
