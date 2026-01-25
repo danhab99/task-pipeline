@@ -5,7 +5,7 @@
   };
 
   outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachSystem flake-utils.lib.defaultSystems (system:
+    (flake-utils.lib.eachSystem flake-utils.lib.defaultSystems (system:
       let
         pkgs = import nixpkgs {
           inherit system;
@@ -13,7 +13,9 @@
         };
         lib = pkgs.lib;
 
-      in {
+        grit = import ./lib.nix { };
+      in
+      {
         packages = {
           default = pkgs.buildGoModule {
             pname = "task-pipeline";
@@ -40,19 +42,16 @@
           ];
 
           shellHook = ''
-            echo "Task Pipeline development environment"
-            echo "Go version: $(go version)"
-            echo ""
-            echo "Available commands:"
-            echo "  go build      - Build the project"
-            echo "  go test       - Run tests"
-            echo "  go mod vendor - Update vendors for nix"
-            echo "  dlv debug     - Debug with Delve"
             export OUTPUT_DIR=$(mktemp -d)
           '';
 
           CGO_CFLAGS = "-U_FORTIFY_SOURCE";
           CGO_CPPFLAGS = "-U_FORTIFY_SOURCE";
         };
-      });
+
+        checks = import ./checks.nix { inherit pkgs grit; };
+      }
+    )) // {
+      lib = import ./lib.nix { };
+    };
 }
