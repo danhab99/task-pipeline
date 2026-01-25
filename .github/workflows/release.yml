@@ -11,44 +11,141 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            runner: ubuntu-latest
+          - os: linux
+            arch: arm64
+            runner: ubuntu-latest
+          - os: darwin
+            arch: amd64
+            runner: macos-13
+          - os: darwin
+            arch: arm64
+            runner: macos-14
+          - os: windows
+            arch: amd64
+            runner: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@v14
-
-      - name: Setup Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@v8
-
-      - name: Build with Nix
-        run: nix build
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
 
       - name: Get version from tag
         id: get_version
         run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
-      - name: Copy binary
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 1
         run: |
-          mkdir -p dist
-          cp result/bin/task-pipeline dist/task-pipeline-linux-x86_64
-          chmod +x dist/task-pipeline-linux-x86_64
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            sudo apt-get update && sudo apt-get install -y gcc-mingw-w64
+            export CC=x86_64-w64-mingw32-gcc
+            export CGO_ENABLED=1
+            go build -o task-pipeline-${{ matrix.os }}-${{ matrix.arch }}.exe -ldflags="-s -w" .
+          elif [ "${{ matrix.os }}" = "linux" ] && [ "${{ matrix.arch }}" = "arm64" ]; then
+            sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+            export CC=aarch64-linux-gnu-gcc
+            go build -o task-pipeline-${{ matrix.os }}-${{ matrix.arch }} -ldflags="-s -w" .
+          else
+            go build -o task-pipeline-${{ matrix.os }}-${{ matrix.arch }} -ldflags="-s -w" .
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: task-pipeline-${{ matrix.os }}-${{ matrix.arch }}
+          path: task-pipeline-${{ matrix.os }}-${{ matrix.arch }}*
+          retention-days: 1
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh dist/
+
+      - name: Create checksums
+        run: |
+          cd dist
+          sha256sum task-pipeline-* > checksums.txt
+          cat checksums.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
-            dist/task-pipeline-linux-x86_64
+            dist/task-pipeline-*
+            dist/checksums.txt
           body: |
             ## Installation
             
             ### Download Binary
+            
+            **Linux (amd64)**
             ```bash
-            wget https://github.com/${{ github.repository }}/releases/download/${{ steps.get_version.outputs.VERSION }}/task-pipeline-linux-x86_64
-            chmod +x task-pipeline-linux-x86_64
-            sudo mv task-pipeline-linux-x86_64 /usr/local/bin/task-pipeline
+            wget https://github.com/${{ github.repository }}/releases/download/${{ steps.get_version.outputs.VERSION }}/task-pipeline-linux-amd64
+            chmod +x task-pipeline-linux-amd64
+            sudo mv task-pipeline-linux-amd64 /usr/local/bin/task-pipeline
+            ```
+            
+            **Linux (arm64)**
+            ```bash
+            wget https://github.com/${{ github.repository }}/releases/download/${{ steps.get_version.outputs.VERSION }}/task-pipeline-linux-arm64
+            chmod +x task-pipeline-linux-arm64
+            sudo mv task-pipeline-linux-arm64 /usr/local/bin/task-pipeline
+            ```
+            
+            **macOS (Intel)**
+            ```bash
+            wget https://github.com/${{ github.repository }}/releases/download/${{ steps.get_version.outputs.VERSION }}/task-pipeline-darwin-amd64
+            chmod +x task-pipeline-darwin-amd64
+            sudo mv task-pipeline-darwin-amd64 /usr/local/bin/task-pipeline
+            ```
+            
+            **macOS (Apple Silicon)**
+            ```bash
+            wget https://github.com/${{ github.repository }}/releases/download/${{ steps.get_version.outputs.VERSION }}/task-pipeline-darwin-arm64
+            chmod +x task-pipeline-darwin-arm64
+            sudo mv task-pipeline-darwin-arm64 /usr/local/bin/task-pipeline
+            ```
+            
+            **Windows (amd64)**
+            ```powershell
+            Invoke-WebRequest -Uri "https://github.com/${{ github.repository }}/releases/download/${{ steps.get_version.outputs.VERSION }}/task-pipeline-windows-amd64.exe" -OutFile "task-pipeline.exe"
+            ```
+            
+            ### Verify Checksums
+            ```bash
+            wget https://github.com/${{ github.repository }}/releases/download/${{ steps.get_version.outputs.VERSION }}/checksums.txt
+            sha256sum -c checksums.txt
             ```
             
             ### Using Nix Flakes
@@ -65,24 +162,4 @@ jobs:
           draft: false
           prerelease: false
 
-  build-check:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
 
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@v14
-
-      - name: Setup Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@v8
-
-      - name: Check flake
-        run: nix flake check
-
-      - name: Build with Nix
-        run: nix build
-
-      - name: Test binary
-        run: ./result/bin/task-pipeline --help

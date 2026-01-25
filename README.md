@@ -150,62 +150,6 @@ cat $INPUT_FILE | sort > $OUTPUT_DIR/next
 ./task-pipeline -manifest manifest.toml --db ./db -run -quiet
 ```
 
-## Visibility & Output
-
-The pipeline provides three output modes for different use cases:
-
-### Normal Mode (default)
-- Shows step execution progress
-- Real-time progress bars with task counts
-- Important operation status
-- Warnings and errors
-- Summary statistics at completion
-
-### Verbose Mode (`-verbose`)
-- Everything in normal mode PLUS:
-- Detailed task registration information
-- Input/output file paths and sizes
-- Script commands being executed
-- Script stdout/stderr in real-time
-- Database operation details
-
-### Quiet Mode (`-quiet`)
-- Minimal output
-- Only critical errors
-- No progress bars
-- Ideal for scripts and CI/CD pipelines
-
-### Color-Coded Output
-- 🟣 **Magenta/Purple**: Main program operations and step names
-- 🔵 **Blue**: Run controller
-- 🟢 **Cyan**: Pipeline execution
-- 🟡 **Yellow**: Script output
-- 🟢 **Green**: Success messages
-- 🔴 **Red**: Error messages
-
-### Output Examples
-
-**Execution progress:**
-```
-▶ Step: fetch
-  → Task 1 | Step: fetch
-    Processing fetch ████████████████░░░░  50% [5/10] [2.3 it/s]
-  Step 'fetch' complete: 10/10 tasks
-```
-
-**Summary statistics:**
-```
-╔══════════════════════════════════════════════════════════╗
-║ Pipeline Execution Summary                               ║
-╠══════════════════════════════════════════════════════════╣
-║ Total Tasks:         42                                  ║
-║ Total Rounds:        3                                   ║
-║ Parallel Workers:    8                                   ║
-║ Execution Time:      2.345s                              ║
-║ Avg Task Rate:       17.91 tasks/sec                     ║
-╚══════════════════════════════════════════════════════════╝
-```
-
 ## Overview
 
 Task Pipeline is a workflow automation tool that:
