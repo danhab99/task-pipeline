@@ -58,9 +58,7 @@ Add this flake as an input to your NixOS configuration flake:
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     grit = {
-      url = "path:/home/dan/Documents/go/src/grit";
-      # Or use a git repository:
-      # url = "github:danhab99/grit";
+      url = "github:danhab99/grit";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -559,19 +557,17 @@ tr '[:lower:]' '[:upper:]' < $INPUT_FILE | rev > $OUTPUT_DIR/processed
 
 ## Output
 
-The program provides intelligent logging based on your chosen output mode:
+The program provides logging based on the log level flag:
 
-### Normal Mode Output
+### Normal Mode Output (default)
 - Manifest loading and step count
 - Database initialization (SQLite + BadgerDB)
-- Disk space warnings
 - Step execution with colored indicators
-- Real-time progress bars for each step
-- Task completion counts with statistics
+- Task execution information
 - Resource creation notifications
 - Execution summary with total duration
 
-### Verbose Mode Output  
+### Verbose Mode Output (`-verbose`)
 Everything in Normal mode plus:
 - Step registration details with version info
 - Database operation details (task scheduling, resource lookups)
@@ -581,15 +577,7 @@ Everything in Normal mode plus:
 - Individual task processing information
 - FUSE mount/unmount operations
 
-### Quiet Mode Output
+### Quiet Mode Output (`-quiet`)
 - Only critical errors and failures
 - No progress indicators or status updates
 - Suitable for CI/CD and automated environments
-
-### TaskTracker Output
-- Nix-style build output formatting
-- Grouped task logs per step
-- Collapsible output sections
-- Color-coded success/failure indicators
-
-For complete details about visibility features, see the Logger component documentation.
