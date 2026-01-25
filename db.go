@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -22,6 +23,7 @@ CREATE TABLE IF NOT EXISTS step (
   script    TEXT NOT NULL,
   is_start  INTEGER DEFAULT 0,
   parallel  INTEGER,
+  inputs    TEXT,
   version   INTEGER DEFAULT 1,
   UNIQUE(name, version)
 );
@@ -32,7 +34,6 @@ CREATE TABLE IF NOT EXISTS task (
   input_resource_id INTEGER,
   processed        INTEGER DEFAULT 0,
   error            TEXT,
-  runset           TEXT DEFAULT (CURRENT_TIMESTAMP),
 
   FOREIGN KEY(step_id) REFERENCES step(id),
   FOREIGN KEY(input_resource_id) REFERENCES resource(id),
@@ -43,25 +44,21 @@ CREATE TABLE IF NOT EXISTS resource (
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
   name             TEXT NOT NULL,
   object_hash      VARCHAR(64) NOT NULL,
-  step_id          INTEGER NOT NULL,
   created_at       TEXT DEFAULT (CURRENT_TIMESTAMP),
 
-  FOREIGN KEY(step_id) REFERENCES step(id),
-  UNIQUE(name, object_hash, step_id)
+  UNIQUE(name, object_hash)
 );
 
 CREATE INDEX IF NOT EXISTS idx_step_name ON step(name);
 CREATE INDEX IF NOT EXISTS idx_task_step ON task(step_id);
 CREATE INDEX IF NOT EXISTS idx_task_processed ON task(processed);
 CREATE INDEX IF NOT EXISTS idx_resource_name ON resource(name);
-CREATE INDEX IF NOT EXISTS idx_resource_step ON resource(step_id);
 CREATE INDEX IF NOT EXISTS idx_task_input_resource ON task(input_resource_id);
 `
 
 type Database struct {
 	db        *sql.DB
 	repo_path string
-	runset    string
 	badgerDB  *badger.DB
 }
 
@@ -71,6 +68,7 @@ type Step struct {
 	Script   string
 	IsStart  bool
 	Parallel *int
+	Inputs   []string
 	Version  int
 }
 
@@ -86,7 +84,6 @@ type Resource struct {
 	ID         int64
 	Name       string
 	ObjectHash string
-	StepID     int64
 	CreatedAt  string
 }
 
@@ -101,7 +98,7 @@ func (t Task) String() string {
 	return fmt.Sprintf("Task(id=%d step_id=%d processed=%v error=%s)", t.ID, t.StepID, t.Processed, e)
 }
 
-func NewDatabase(repo_path string, runset string) (Database, error) {
+func NewDatabase(repo_path string) (Database, error) {
 	err := os.MkdirAll(repo_path, 0755)
 	if err != nil {
 		return Database{}, err
@@ -170,31 +167,53 @@ func NewDatabase(repo_path string, runset string) (Database, error) {
 		return Database{}, fmt.Errorf("failed to open BadgerDB: %w", err)
 	}
 
-	return Database{db, repo_path, runset, badgerDB}, nil
+	return Database{db, repo_path, badgerDB}, nil
 }
 
 // Step CRUD operations
 
 func (d Database) CreateStep(step Step) (int64, error) {
-	// Check if a step with the same name and script already exists
-	var existingID int64
-	err := d.db.QueryRow("SELECT id FROM step WHERE name = ? AND script = ? LIMIT 1", step.Name, step.Script).Scan(&existingID)
-	if err == nil {
-		// Step with same name and script exists, return its ID
-
-		s := 0
-		if step.IsStart {
-			s = 1
-		}
-
-		_, err := d.db.Exec("UPDATE step SET parallel = ?, is_start = ? WHERE id = ?", step.Parallel, s, existingID)
+	// Serialize inputs to JSON for storage and comparison
+	// Treat nil and empty slices the same way
+	var inputsStr string
+	if len(step.Inputs) > 0 {
+		inputsJSON, err := json.Marshal(step.Inputs)
 		if err != nil {
-			panic(err)
+			return 0, fmt.Errorf("failed to marshal inputs: %w", err)
+		}
+		inputsStr = string(inputsJSON)
+	} else {
+		inputsStr = "[]"
+	}
+
+	// Check if a step with the same name, script, and inputs already exists
+	var existingID int64
+	var existingInputs sql.NullString
+	err := d.db.QueryRow("SELECT id, inputs FROM step WHERE name = ? AND script = ? ORDER BY version DESC LIMIT 1", step.Name, step.Script).Scan(&existingID, &existingInputs)
+	if err == nil {
+		// Step with same name and script exists, check if inputs match
+		existingInputsStr := "[]"
+		if existingInputs.Valid && existingInputs.String != "" {
+			existingInputsStr = existingInputs.String
 		}
 
-		return existingID, nil
+		if existingInputsStr == inputsStr {
+			// Inputs match, update parallel and is_start flags
+			s := 0
+			if step.IsStart {
+				s = 1
+			}
+
+			_, err := d.db.Exec("UPDATE step SET parallel = ?, is_start = ? WHERE id = ?", step.Parallel, s, existingID)
+			if err != nil {
+				return 0, err
+			}
+
+			return existingID, nil
+		}
+		// Inputs changed, need to create a new version
 	}
-	if err != sql.ErrNoRows {
+	if err != nil && err != sql.ErrNoRows {
 		return 0, err
 	}
 
@@ -211,9 +230,9 @@ func (d Database) CreateStep(step Step) (int64, error) {
 	}
 
 	res, err := d.db.Exec(`
-INSERT INTO step (name, script, is_start, parallel, version)
-VALUES (?, ?, ?, ?, ?)
-`, step.Name, step.Script, step.IsStart, step.Parallel, version)
+INSERT INTO step (name, script, is_start, parallel, inputs, version)
+VALUES (?, ?, ?, ?, ?, ?)
+`, step.Name, step.Script, step.IsStart, step.Parallel, inputsStr, version)
 	if err != nil {
 		return 0, err
 	}
@@ -223,8 +242,9 @@ VALUES (?, ?, ?, ?, ?)
 func (d Database) GetStep(id int64) (*Step, error) {
 	var step Step
 	var parallel sql.NullInt64
-	err := d.db.QueryRow("SELECT id, name, script, is_start, parallel, version FROM step WHERE id = ?", id).Scan(
-		&step.ID, &step.Name, &step.Script, &step.IsStart, &parallel, &step.Version,
+	var inputsJSON sql.NullString
+	err := d.db.QueryRow("SELECT id, name, script, is_start, parallel, inputs, version FROM step WHERE id = ?", id).Scan(
+		&step.ID, &step.Name, &step.Script, &step.IsStart, &parallel, &inputsJSON, &step.Version,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -235,6 +255,11 @@ func (d Database) GetStep(id int64) (*Step, error) {
 	if parallel.Valid {
 		val := int(parallel.Int64)
 		step.Parallel = &val
+	}
+	if inputsJSON.Valid && inputsJSON.String != "" {
+		if err := json.Unmarshal([]byte(inputsJSON.String), &step.Inputs); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal inputs: %w", err)
+		}
 	}
 	return &step, nil
 }
@@ -242,8 +267,9 @@ func (d Database) GetStep(id int64) (*Step, error) {
 func (d Database) GetStepByName(name string) (*Step, error) {
 	var step Step
 	var parallel sql.NullInt64
-	err := d.db.QueryRow("SELECT id, name, script, is_start, parallel, version FROM step WHERE name = ? ORDER BY version DESC LIMIT 1", name).Scan(
-		&step.ID, &step.Name, &step.Script, &step.IsStart, &parallel, &step.Version,
+	var inputsJSON sql.NullString
+	err := d.db.QueryRow("SELECT id, name, script, is_start, parallel, inputs, version FROM step WHERE name = ? ORDER BY version DESC LIMIT 1", name).Scan(
+		&step.ID, &step.Name, &step.Script, &step.IsStart, &parallel, &inputsJSON, &step.Version,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -254,6 +280,11 @@ func (d Database) GetStepByName(name string) (*Step, error) {
 	if parallel.Valid {
 		val := int(parallel.Int64)
 		step.Parallel = &val
+	}
+	if inputsJSON.Valid && inputsJSON.String != "" {
+		if err := json.Unmarshal([]byte(inputsJSON.String), &step.Inputs); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal inputs: %w", err)
+		}
 	}
 	return &step, nil
 }
@@ -261,8 +292,9 @@ func (d Database) GetStepByName(name string) (*Step, error) {
 func (d Database) GetStartingStep() (*Step, error) {
 	var step Step
 	var parallel sql.NullInt64
-	err := d.db.QueryRow("SELECT id, name, script, is_start, parallel, version FROM step WHERE is_start = 1 ORDER BY version DESC LIMIT 1").Scan(
-		&step.ID, &step.Name, &step.Script, &step.IsStart, &parallel, &step.Version,
+	var inputsJSON sql.NullString
+	err := d.db.QueryRow("SELECT id, name, script, is_start, parallel, inputs, version FROM step WHERE is_start = 1 ORDER BY version DESC LIMIT 1").Scan(
+		&step.ID, &step.Name, &step.Script, &step.IsStart, &parallel, &inputsJSON, &step.Version,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -273,6 +305,11 @@ func (d Database) GetStartingStep() (*Step, error) {
 	if parallel.Valid {
 		val := int(parallel.Int64)
 		step.Parallel = &val
+	}
+	if inputsJSON.Valid && inputsJSON.String != "" {
+		if err := json.Unmarshal([]byte(inputsJSON.String), &step.Inputs); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal inputs: %w", err)
+		}
 	}
 	return &step, nil
 }
@@ -305,7 +342,7 @@ func (d Database) ListSteps() chan Step {
 	go func() {
 		defer close(stepChan)
 
-		rows, err := d.db.Query("SELECT id, name, script, is_start, parallel, version FROM step ORDER BY id")
+		rows, err := d.db.Query("SELECT id, name, script, is_start, parallel, inputs, version FROM step ORDER BY id")
 		if err != nil {
 			panic(err)
 		}
@@ -314,12 +351,18 @@ func (d Database) ListSteps() chan Step {
 		for rows.Next() {
 			var step Step
 			var parallel sql.NullInt64
-			if err := rows.Scan(&step.ID, &step.Name, &step.Script, &step.IsStart, &parallel, &step.Version); err != nil {
+			var inputsJSON sql.NullString
+			if err := rows.Scan(&step.ID, &step.Name, &step.Script, &step.IsStart, &parallel, &inputsJSON, &step.Version); err != nil {
 				panic(err)
 			}
 			if parallel.Valid {
 				val := int(parallel.Int64)
 				step.Parallel = &val
+			}
+			if inputsJSON.Valid && inputsJSON.String != "" {
+				if err := json.Unmarshal([]byte(inputsJSON.String), &step.Inputs); err != nil {
+					dbLogger.Printf("Warning: failed to unmarshal inputs for step %d: %v", step.ID, err)
+				}
 			}
 			stepChan <- step
 		}
@@ -338,13 +381,13 @@ func (d Database) GetTaintedSteps() chan Step {
 	go func() {
 		defer close(stepChan)
 
-		// Find all steps where there's a newer version with a different script
+		// Find all steps where there's a newer version with a different script or inputs
 		rows, err := d.db.Query(`
-			SELECT s1.id, s1.name, s1.script, s1.is_start, s1.parallel, s1.version
+			SELECT s1.id, s1.name, s1.script, s1.is_start, s1.parallel, s1.inputs, s1.version
 			FROM step s1
 			INNER JOIN step s2 ON s1.name = s2.name
 			WHERE s1.version < s2.version
-			  AND s1.script != s2.script
+			  AND (s1.script != s2.script OR COALESCE(s1.inputs, '') != COALESCE(s2.inputs, ''))
 			GROUP BY s1.id
 			ORDER BY s1.name, s1.version
 		`)
@@ -356,12 +399,18 @@ func (d Database) GetTaintedSteps() chan Step {
 		for rows.Next() {
 			var step Step
 			var parallel sql.NullInt64
-			if err := rows.Scan(&step.ID, &step.Name, &step.Script, &step.IsStart, &parallel, &step.Version); err != nil {
+			var inputsJSON sql.NullString
+			if err := rows.Scan(&step.ID, &step.Name, &step.Script, &step.IsStart, &parallel, &inputsJSON, &step.Version); err != nil {
 				panic(err)
 			}
 			if parallel.Valid {
 				val := int(parallel.Int64)
 				step.Parallel = &val
+			}
+			if inputsJSON.Valid && inputsJSON.String != "" {
+				if err := json.Unmarshal([]byte(inputsJSON.String), &step.Inputs); err != nil {
+					dbLogger.Printf("Warning: failed to unmarshal inputs for step %d: %v", step.ID, err)
+				}
 			}
 			stepChan <- step
 		}
@@ -378,7 +427,7 @@ func (d Database) GetTaintedSteps() chan Step {
 
 // CreateResourceFromReader reads data from an io.Reader, stores it in BadgerDB, and creates a resource record in SQLite.
 // Returns the resource ID and the calculated hash.
-func (d Database) CreateResourceFromReader(name string, reader io.Reader, stepID int64) (int64, string, error) {
+func (d Database) CreateResourceFromReader(name string, reader io.Reader) (int64, string, error) {
 	// Read all data and calculate hash
 	data, err := io.ReadAll(reader)
 	if err != nil {
@@ -400,7 +449,7 @@ func (d Database) CreateResourceFromReader(name string, reader io.Reader, stepID
 	}
 
 	// Create resource record in SQLite
-	resourceID, err := d.CreateResource(name, hash, stepID)
+	resourceID, err := d.CreateResource(name, hash)
 	if err != nil {
 		return 0, "", fmt.Errorf("failed to create resource record: %w", err)
 	}
@@ -408,13 +457,13 @@ func (d Database) CreateResourceFromReader(name string, reader io.Reader, stepID
 	return resourceID, hash, nil
 }
 
-func (d Database) CreateResource(name string, objectHash string, stepID int64) (int64, error) {
+func (d Database) CreateResource(name string, objectHash string) (int64, error) {
 	// First check if the resource already exists
 	var existingID int64
 	err := d.db.QueryRow(`
 		SELECT id FROM resource 
-		WHERE name = ? AND object_hash = ? AND step_id = ?
-	`, name, objectHash, stepID).Scan(&existingID)
+		WHERE name = ? AND object_hash = ?
+	`, name, objectHash).Scan(&existingID)
 	if err == nil {
 		// Resource already exists, return its ID
 		return existingID, nil
@@ -425,9 +474,9 @@ func (d Database) CreateResource(name string, objectHash string, stepID int64) (
 
 	// Resource doesn't exist, insert it
 	res, err := d.db.Exec(`
-INSERT INTO resource (name, object_hash, step_id)
-VALUES (?, ?, ?)
-`, name, objectHash, stepID)
+INSERT INTO resource (name, object_hash)
+VALUES (?, ?)
+`, name, objectHash)
 	if err != nil {
 		return 0, err
 	}
@@ -442,8 +491,8 @@ VALUES (?, ?, ?)
 
 func (d Database) GetResource(id int64) (*Resource, error) {
 	var r Resource
-	err := d.db.QueryRow("SELECT id, name, object_hash, step_id, created_at FROM resource WHERE id = ?", id).Scan(
-		&r.ID, &r.Name, &r.ObjectHash, &r.StepID, &r.CreatedAt,
+	err := d.db.QueryRow("SELECT id, name, object_hash, created_at FROM resource WHERE id = ?", id).Scan(
+		&r.ID, &r.Name, &r.ObjectHash, &r.CreatedAt,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -460,7 +509,7 @@ func (d Database) GetResourcesByName(name string) chan Resource {
 	go func() {
 		defer close(resourceChan)
 
-		rows, err := d.db.Query("SELECT id, name, object_hash, step_id, created_at FROM resource WHERE name = ? ORDER BY created_at DESC", name)
+		rows, err := d.db.Query("SELECT id, name, object_hash, created_at FROM resource WHERE name = ? ORDER BY created_at DESC", name)
 		if err != nil {
 			dbLogger.Printf("Error querying resources by name %s: %v", name, err)
 			return
@@ -469,7 +518,7 @@ func (d Database) GetResourcesByName(name string) chan Resource {
 
 		for rows.Next() {
 			var r Resource
-			if err := rows.Scan(&r.ID, &r.Name, &r.ObjectHash, &r.StepID, &r.CreatedAt); err != nil {
+			if err := rows.Scan(&r.ID, &r.Name, &r.ObjectHash, &r.CreatedAt); err != nil {
 				dbLogger.Printf("Error scanning resource: %v", err)
 				return
 			}
@@ -484,22 +533,28 @@ func (d Database) GetResourcesByName(name string) chan Resource {
 	return resourceChan
 }
 
-func (d Database) GetResourcesProducedByStep(stepID int64) chan Resource {
+func (d Database) CountResources() (int64, error) {
+	var count int64
+	err := d.db.QueryRow("SELECT COUNT(*) FROM resource").Scan(&count)
+	return count, err
+}
+
+func (d Database) GetAllResources() chan Resource {
 	resourceChan := make(chan Resource)
 
 	go func() {
 		defer close(resourceChan)
 
-		rows, err := d.db.Query("SELECT id, name, object_hash, step_id, created_at FROM resource WHERE step_id = ? ORDER BY created_at DESC", stepID)
+		rows, err := d.db.Query("SELECT id, name, object_hash, created_at FROM resource ORDER BY created_at DESC")
 		if err != nil {
-			dbLogger.Printf("Error querying resources for step %d: %v", stepID, err)
+			dbLogger.Printf("Error querying all resources: %v", err)
 			return
 		}
 		defer rows.Close()
 
 		for rows.Next() {
 			var r Resource
-			if err := rows.Scan(&r.ID, &r.Name, &r.ObjectHash, &r.StepID, &r.CreatedAt); err != nil {
+			if err := rows.Scan(&r.ID, &r.Name, &r.ObjectHash, &r.CreatedAt); err != nil {
 				dbLogger.Printf("Error scanning resource: %v", err)
 				return
 			}
@@ -522,7 +577,7 @@ func (d Database) GetUnconsumedResourcesByName(name string, consumingStepID int6
 
 		// Find resources with this name that don't have a task in the consuming step that uses them as input
 		rows, err := d.db.Query(`
-			SELECT r.id, r.name, r.object_hash, r.step_id, r.created_at 
+			SELECT r.id, r.name, r.object_hash, r.created_at 
 			FROM resource r
 			WHERE r.name = ?
 			AND NOT EXISTS (
@@ -540,7 +595,7 @@ func (d Database) GetUnconsumedResourcesByName(name string, consumingStepID int6
 
 		for rows.Next() {
 			var r Resource
-			if err := rows.Scan(&r.ID, &r.Name, &r.ObjectHash, &r.StepID, &r.CreatedAt); err != nil {
+			if err := rows.Scan(&r.ID, &r.Name, &r.ObjectHash, &r.CreatedAt); err != nil {
 				dbLogger.Printf("Error scanning resource: %v", err)
 				return
 			}
@@ -560,20 +615,15 @@ func (d Database) DeleteResource(id int64) error {
 	return err
 }
 
-func (d Database) DeleteResourcesProducedByStep(stepID int64) error {
-	_, err := d.db.Exec("DELETE FROM resource WHERE step_id = ?", stepID)
-	return err
-}
-
 // GetTaskInputResource returns the input resource for a task (if any)
 func (d Database) GetTaskInputResource(taskID int64) (*Resource, error) {
 	var r Resource
 	err := d.db.QueryRow(`
-		SELECT r.id, r.name, r.object_hash, r.step_id, r.created_at
+		SELECT r.id, r.name, r.object_hash, r.created_at
 		FROM resource r
 		INNER JOIN task t ON r.id = t.input_resource_id
 		WHERE t.id = ?
-	`, taskID).Scan(&r.ID, &r.Name, &r.ObjectHash, &r.StepID, &r.CreatedAt)
+	`, taskID).Scan(&r.ID, &r.Name, &r.ObjectHash, &r.CreatedAt)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -591,9 +641,9 @@ func (d Database) CreateTask(task Task) (int64, error) {
 		p = 1
 	}
 	res, err := d.db.Exec(`
-INSERT INTO task (step_id, input_resource_id, processed, error, runset)
-VALUES (?, ?, ?, ?, ?)
-`, task.StepID, task.InputResourceID, p, task.Error, d.runset)
+INSERT INTO task (step_id, input_resource_id, processed, error)
+VALUES (?, ?, ?, ?)
+`, task.StepID, task.InputResourceID, p, task.Error)
 	if err != nil {
 		return 0, err
 	}
@@ -613,8 +663,8 @@ func (d Database) BatchInsertTasks(tasks []Task) ([]Task, error) {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-	INSERT INTO task (step_id, input_resource_id, processed, error, runset)
-	VALUES (?, ?, ?, ?, ?)`)
+	INSERT INTO task (step_id, input_resource_id, processed, error)
+	VALUES (?, ?, ?, ?)`)
 	if err != nil {
 		return nil, err
 	}
@@ -625,7 +675,7 @@ func (d Database) BatchInsertTasks(tasks []Task) ([]Task, error) {
 		if task.Processed {
 			p = 1
 		}
-		res, err := stmt.Exec(task.StepID, task.InputResourceID, p, task.Error, d.runset)
+		res, err := stmt.Exec(task.StepID, task.InputResourceID, p, task.Error)
 		if err != nil {
 			return nil, err
 		}
@@ -658,8 +708,8 @@ func (d Database) CreateTasksFromResources(stepID int64, resourceIDs []int64) ([
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO task (step_id, input_resource_id, processed, error, runset)
-		VALUES (?, ?, 0, NULL, ?)
+		INSERT INTO task (step_id, input_resource_id, processed, error)
+		VALUES (?, ?, 0, NULL)
 		ON CONFLICT(step_id, input_resource_id) DO NOTHING
 	`)
 	if err != nil {
@@ -669,7 +719,7 @@ func (d Database) CreateTasksFromResources(stepID int64, resourceIDs []int64) ([
 
 	var taskIDs []int64
 	for _, resourceID := range resourceIDs {
-		res, err := stmt.Exec(stepID, resourceID, d.runset)
+		res, err := stmt.Exec(stepID, resourceID)
 		if err != nil {
 			return nil, err
 		}
@@ -690,6 +740,60 @@ func (d Database) CreateTasksFromResources(stepID int64, resourceIDs []int64) ([
 	}
 
 	return taskIDs, nil
+}
+
+// ScheduleTasksForStep creates tasks for all unconsumed resources matching the step's inputs.
+// Uses a single SQL INSERT to efficiently schedule all tasks at once.
+// Returns the number of new tasks created.
+func (d Database) ScheduleTasksForStep(stepID int64) (int64, error) {
+	step, err := d.GetStep(stepID)
+	if err != nil {
+		return 0, err
+	}
+
+	if len(step.Inputs) == 0 {
+		dbLogger.Printf("Step %d (%s) has no inputs, skipping scheduling", stepID, step.Name)
+		return 0, nil
+	}
+
+	// Build IN clause for input resource names
+	inputsJSON, err := json.Marshal(step.Inputs)
+	if err != nil {
+		return 0, fmt.Errorf("failed to marshal inputs: %w", err)
+	}
+
+	dbLogger.Printf("Scheduling tasks for step %d (%s) with inputs: %s", stepID, step.Name, string(inputsJSON))
+
+	// Single SQL statement to create tasks for all unconsumed resources
+	// that match the step's input names
+	result, err := d.db.Exec(`
+		INSERT INTO task (step_id, input_resource_id, processed, error)
+		SELECT ?, r.id, 0, NULL
+		FROM resource r
+		WHERE r.name IN (SELECT value FROM json_each(?))
+		  AND NOT EXISTS (
+		      SELECT 1 FROM task t 
+		      WHERE t.step_id = ? 
+		        AND t.input_resource_id = r.id
+		  )
+	`, stepID, string(inputsJSON), stepID)
+	
+	if err != nil {
+		return 0, fmt.Errorf("failed to schedule tasks: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+
+	if rowsAffected > 0 {
+		dbLogger.Printf("Scheduled %d new tasks for step %d (%s)", rowsAffected, stepID, step.Name)
+	} else {
+		dbLogger.Printf("No new tasks scheduled for step %d (%s) - no matching unconsumed resources", stepID, step.Name)
+	}
+
+	return rowsAffected, nil
 }
 
 func (d Database) GetTask(id int64) (*Task, error) {
@@ -747,57 +851,12 @@ func (d Database) MarkStepUndone(stepID int64) error {
 
 	tasksDeleted, _ := result.RowsAffected()
 
-	// Delete all resources produced by this step
-	_, err = tx.Exec("DELETE FROM resource WHERE step_id = ?", stepID)
-	if err != nil {
-		return err
-	}
-
 	if err := tx.Commit(); err != nil {
 		return err
 	}
 
 	dbLogger.Printf("Marked step %d as undone: deleted %d tasks and their resources", stepID, tasksDeleted)
 	return nil
-}
-
-func (d Database) MigrateTaintedStepTasks(taintedStepID int64) (int64, error) {
-	// Get the tainted step to find its name
-	taintedStep, err := d.GetStep(taintedStepID)
-	if err != nil {
-		return 0, err
-	}
-	if taintedStep == nil {
-		return 0, fmt.Errorf("step with id %d not found", taintedStepID)
-	}
-
-	// Get the latest version of the step
-	latestStep, err := d.GetStepByName(taintedStep.Name)
-	if err != nil {
-		return 0, err
-	}
-	if latestStep == nil {
-		return 0, fmt.Errorf("no step found with name %s", taintedStep.Name)
-	}
-
-	// Copy all tasks from tainted step to latest step as new unprocessed tasks
-	// This preserves the old tasks as historical records
-	result, err := d.db.Exec(`
-INSERT INTO task (object_hash, step_id, input_task_id, processed, error, runset)
-SELECT object_hash, ?, input_task_id, 0, NULL, runset
-FROM task
-WHERE step_id = ?
-`, latestStep.ID, taintedStepID)
-	if err != nil {
-		return 0, err
-	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-
-	return rowsAffected, nil
 }
 
 func (d Database) DeleteTask(id int64) error {
