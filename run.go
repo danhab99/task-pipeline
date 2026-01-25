@@ -79,8 +79,12 @@ func run(manifest Manifest, database Database, parallel int, startStepName strin
 		}
 		seedTask.ID = seedTaskID
 
+		outputChan := database.MakeResourceConsumer()
+
 		executor := NewScriptExecutor(&database, pipeline)
-		execErr := executor.Execute(seedTask, *startStep)
+		execErr := executor.Execute(seedTask, *startStep, outputChan)
+
+		close(outputChan)
 
 		var errorMsg *string
 		if execErr != nil {
@@ -108,7 +112,7 @@ func run(manifest Manifest, database Database, parallel int, startStepName strin
 	for _, step := range steps {
 		executions := pipeline.ExecuteStep(step, parallel)
 		totalExecutions += executions
-		
+
 		if executions > 0 {
 			runLogger.Printf("Step %s: executed %d tasks", step.Name, executions)
 		}

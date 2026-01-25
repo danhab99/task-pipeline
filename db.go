@@ -777,7 +777,7 @@ func (d Database) ScheduleTasksForStep(stepID int64) (int64, error) {
 		        AND t.input_resource_id = r.id
 		  )
 	`, stepID, string(inputsJSON), stepID)
-	
+
 	if err != nil {
 		return 0, fmt.Errorf("failed to schedule tasks: %w", err)
 	}
@@ -1163,4 +1163,22 @@ func (d Database) Close() error {
 		return fmt.Errorf("failed to close BadgerDB: %w", err)
 	}
 	return nil
+}
+
+func (db Database) MakeResourceConsumer() chan FileData {
+	outputChan := make(chan FileData, 100) // Buffered to prevent deadlock
+
+	// Single FUSE server collects all resources
+	go func() {
+		for data := range outputChan {
+			_, hash, err := db.CreateResourceFromReader(data.Name, data.Reader)
+			if err != nil {
+				pipelineLogger.Printf("Error creating resource %s: %v", data.Name, err)
+				continue
+			}
+			pipelineLogger.Printf("Created resource %s (hash: %s)", data.Name, hash[:16]+"...")
+		}
+	}()
+
+	return outputChan
 }
