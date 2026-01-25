@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -15,14 +16,15 @@ import (
 
 // FuseWatcher watches a FUSE mount point and consumes files written to it
 type FuseWatcher struct {
-	mountPath  string
-	server     *fuse.Server
-	entries    chan fs.DirEntry
-	mu         sync.Mutex
-	files      map[string]*fileData
-	closed     bool
-	outputChan chan<- FileData
-	openFiles  sync.WaitGroup // Track open files
+	mountPath       string
+	server          *fuse.Server
+	entries         chan fs.DirEntry
+	mu              sync.Mutex
+	files           map[string]*fileData
+	closed          bool
+	outputChan      chan<- FileData
+	openFiles       sync.WaitGroup // Track open files
+	openFilesCount  atomic.Int64   // Tracks number of open files for monitoring
 }
 
 // FileData contains the filename and content of a file written to the FUSE mount
@@ -103,10 +105,38 @@ func (fw *FuseWatcher) Stop() error {
 	fw.closed = true
 	fw.mu.Unlock()
 
-	// Wait for all open files to be released
-	fuseLogger.Println("Waiting for all open files to be released...")
-	fw.openFiles.Wait()
-	fuseLogger.Println("All files released")
+	// Force process all buffered files immediately
+	initialCount := fw.openFilesCount.Load()
+	if initialCount > 0 {
+		fuseLogger.Printf("Force processing %d files still in buffer\n", initialCount)
+		
+		fw.mu.Lock()
+		// Copy the files map
+		filesToProcess := make(map[string]*fileData)
+		for name, data := range fw.files {
+			filesToProcess[name] = data
+		}
+		fw.mu.Unlock()
+		
+		// Process each buffered file
+		for name, data := range filesToProcess {
+			data.mu.Lock()
+			if len(data.content) > 0 {
+				content := make([]byte, len(data.content))
+				copy(content, data.content)
+				data.mu.Unlock()
+				
+				// Send to output channel
+				if fw.outputChan != nil {
+					reader := &bytesReader{data: content}
+					fw.outputChan <- FileData{Name: name, Reader: reader}
+				}
+			} else {
+				data.mu.Unlock()
+			}
+		}
+		fuseLogger.Printf("Finished force processing %d files\n", len(filesToProcess))
+	}
 
 	err := fw.server.Unmount()
 	close(fw.entries)
@@ -160,6 +190,7 @@ func (fs *fuseFS) Create(name string, flags uint32, mode uint32, context *fuse.C
 	fd := &fileData{content: make([]byte, 0)}
 	fs.watcher.files[name] = fd
 	fs.watcher.openFiles.Add(1) // Track this open file
+	fs.watcher.openFilesCount.Add(1)
 
 	fuseLogger.Printf("create %s flags=%d mode=%d\n", name, flags, mode)
 
@@ -240,13 +271,13 @@ func (f *fuseFile) Release() {
 		}
 	}
 
-	fuseLogger.Printf("release %s %d\n", f.name)
-	// Clean up file from map
-	f.watcher.mu.Lock()
-	delete(f.watcher.files, f.name)
-	f.watcher.mu.Unlock()
-
+	fuseLogger.Printf("release %s\n", f.name)
+	
+	// DON'T delete from map - allow file to be opened/written again
+	// Each Create() will replace the entry with fresh data
+	
 	// Signal that this file is closed
+	f.watcher.openFilesCount.Add(-1)
 	f.watcher.openFiles.Done()
 }
 
