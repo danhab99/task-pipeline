@@ -1,33 +1,36 @@
 # G.R.I.T
 
-> Go Runtime for Itterative Tasks
+> Go Runtime for Iterative Tasks
 
-A Go-based task pipeline system that executes shell scripts in a managed workflow with persistent state tracking.
+A Go-based data pipeline system that executes shell scripts in a managed workflow with persistent state tracking using a dual-database architecture (SQLite + BadgerDB) and a FUSE filesystem for efficient resource management.
 
 ```
      ┌─────────────┐
      │   Manifest  │
+     │  (TOML def) │
      └──────┬──────┘
             │
             ▼
-     ┌─────────────┐     ┌──────────────┐
-     │  Register   │────▶│   Database   │
-     │    Steps    │     │  (SQLite +   │
-     └──────┬──────┘     │   BadgerDB)  │
-            │            └──────────────┘
+     ┌─────────────┐     ┌──────────────────────┐
+     │  Register   │────▶│  Dual Database       │
+     │    Steps    │     │  SQLite: Metadata    │
+     └──────┬──────┘     │  BadgerDB: Objects   │
+            │            └──────────────────────┘
             ▼
-     ┌─────────────────────────┐
-     │  Single FUSE Server     │◀──── All task outputs
-     │  (collects resources)   │
-     └─────────────────────────┘
-            │
-            ▼
-     ┌─────────────────────────┐
-     │  For each step:         │
-     │  1. Schedule tasks      │
-     │  2. Execute tasks       │
-     │  3. Return count        │
-     └─────────────────────────┘
+     ┌───────────────────────────┐
+     │  Create Resources         │◀──── Seed task (start step)
+     │  (from seed or existing)  │
+     └─────────────┬─────────────┘
+                   │
+                   ▼
+     ┌─────────────────────────────┐
+     │  For each step:             │
+     │  1. Schedule tasks from     │
+     │     unconsumed resources    │
+     │  2. Execute in parallel     │
+     │     (FUSE collects output)  │
+     │  3. Create new resources    │
+     └─────────────────────────────┘
 ```
 
 ## Quick Start
@@ -112,20 +115,23 @@ go build -o task-pipeline
 name = "start"
 start = true
 script = '''
-echo "Input data" > $OUTPUT_DIR/process
-echo "More data" > $OUTPUT_DIR/transform
+echo "Input data" > $OUTPUT_DIR/dataset-v1
+echo "More data" > $OUTPUT_DIR/dataset-v2
 '''
 
 [[step]]
 name = "process"
+inputs = "dataset-v1"  # Filter: only process resources named "dataset-v1"
 script = '''
-cat $INPUT_FILE | tr '[:lower:]' '[:upper:]' > $OUTPUT_DIR/next
+cat $INPUT_FILE | tr '[:lower:]' '[:upper:]' > $OUTPUT_DIR/processed
 '''
 
 [[step]]
 name = "transform"
+inputs = "dataset-v2"  # Filter: only process resources named "dataset-v2"
+parallel = 2           # Limit to 2 concurrent tasks for this step
 script = '''
-cat $INPUT_FILE | sort > $OUTPUT_DIR/next
+cat $INPUT_FILE | sort > $OUTPUT_DIR/sorted
 '''
 ```
 
@@ -134,14 +140,20 @@ cat $INPUT_FILE | sort > $OUTPUT_DIR/next
 # Run the pipeline
 ./task-pipeline -manifest manifest.toml --db ./db -run
 
-# Detect and migrate tainted steps (when a step's script changes)
-./task-pipeline -manifest manifest.toml --db ./db -migrate-tainted
-
 # Run with parallel limit
 ./task-pipeline -manifest manifest.toml --db ./db -run -parallel 4
 
 # Specify starting step
 ./task-pipeline -manifest manifest.toml --db ./db -run -start process_name
+
+# Filter to specific steps (can be used multiple times)
+./task-pipeline -manifest manifest.toml --db ./db -run -step process_name -step transform_name
+
+# Export resources by name
+./task-pipeline -manifest manifest.toml --db ./db -export dataset-v1
+
+# Export resource content by hash
+./task-pipeline -manifest manifest.toml --db ./db -export-hash <sha256-hash>
 
 # Run with verbose output (see detailed task and script information)
 ./task-pipeline -manifest manifest.toml --db ./db -run -verbose
@@ -152,13 +164,15 @@ cat $INPUT_FILE | sort > $OUTPUT_DIR/next
 
 ## Overview
 
-Task Pipeline is a workflow automation tool that:
-- Executes tasks defined in a TOML manifest
-- Stores task execution state in a SQLite database
-- Manages task inputs/outputs through a content-addressable object store
-- Supports task chaining and dependencies through step linking
-- Processes multiple task streams concurrently
-- Automatically detects and handles step versioning/tainted steps
+GRIT (Go Runtime for Iterative Tasks) is a workflow automation tool that:
+- Executes tasks defined in a TOML manifest file
+- Stores task execution state and metadata in SQLite
+- Stores task outputs (resources) in BadgerDB using content-addressable storage
+- Manages task inputs/outputs through a write-only FUSE filesystem
+- Supports task chaining through resource-based dependencies
+- Processes multiple task streams concurrently with configurable parallelism
+- Automatically tracks step versioning when scripts change
+- Implements incremental processing by only creating tasks for unconsumed resources
 
 ## Development
 
@@ -233,35 +247,92 @@ nix run github:danhab99/task-pipeline/v0.1.0 -- --help
 
 ## Architecture
 
-The system consists of four main components:
+The system consists of six main components:
 
 ### 1. **Main (`main.go`)**
 Entry point that:
-- Parses command-line flags for manifest and database paths
+- Parses command-line flags for manifest path, database path, and execution options
 - Loads and parses the TOML manifest
-- Initializes the database
-- Registers tasks and creates processing channels
-- Merges task streams and executes steps
+- Initializes the dual-database system (SQLite + BadgerDB)
+- Checks disk space before execution (warns if >85% full)
+- Delegates to run, export by name, or export by hash modes
 
 ### 2. **Manifest (`manifest.go`)**
-Defines the step structure from TOML configuration files.
+Defines the pipeline structure:
+- `Manifest`: Contains array of steps
+- `ManifestStep`: Step properties (name, script, start flag, parallel count, inputs filter)
+- Uses TOML format for declarative configuration
 
 ### 3. **Database (`db.go`)**
-Manages persistent storage with:
-- **Steps table**: Stores step definitions (name, script, version)
-- **Tasks table**: Tracks individual task executions with content hashes and processing status
-- **Object store**: Content-addressable storage using SHA-256 hashes
-- **Step versioning**: Automatically tracks script changes as new versions
+Manages persistent storage with dual-database architecture:
+- **SQLite Database**: 
+  - **steps** table: Stores step definitions with versioning (name, script, version, is_start, parallel, inputs)
+  - **tasks** table: Tracks individual task executions (step_id, input_resource_id, processed, error)
+  - **resources** table: Metadata for outputs (name, object_hash, created_at)
+  - Indexes for efficient queries
+- **BadgerDB Object Store**: 
+  - Content-addressable storage using SHA-256 hashes
+  - Immutable objects with batch operations support
+  - Optimized for write-heavy workloads (128MB memtable)
+  - Efficient large value log handling
 
-The object store uses a sharded directory structure: `objects/AB/CD/EFGH...` where `ABCDEFGH...` is the full hash.
+### 4. **Pipeline (`pipeline.go`)**
+Orchestrates task execution:
+- Creates per-step FUSE filesystem for output collection
+- Schedules tasks from unconsumed resources matching step inputs
+- Executes unprocessed tasks in parallel using worker pools
+- Manages resource-to-task flow with channel-based streaming
 
-### 4. **Executor (`pipeline.go`)**
-Runs individual tasks by:
-- Writing input objects to temporary files
-- Executing the step's shell script with environment variables
-- Reading output files from a designated directory
-- Creating new tasks in the database for downstream steps
-- Handling step versioning and tainted task migration
+### 5. **Executor (`executor.go`)**
+Runs individual tasks:
+- Fetches input resource from BadgerDB and writes to temporary file
+- Mounts write-only FUSE filesystem for task output directory
+- Executes shell script with environment variables (INPUT_FILE, OUTPUT_DIR)
+- Captures stdout/stderr with per-task logging
+- Collects outputs from FUSE and stores as new resources
+
+### 6. **FUSE Watcher (`fuse_watcher.go`)**
+Write-only filesystem for task outputs:
+- Mounts temporary FUSE filesystem at `/tmp/output-*`
+- Captures file writes from scripts and converts to resources
+- Supports file rewrites (later writes replace earlier ones)
+- Implements graceful shutdown with 2-second timeout
+- Provides backpressure control via buffered channels
+- Disables directory listing and read operations for isolation
+
+## Resource Model & Data Flow
+
+GRIT uses a **resource-based execution model** where data flows through the pipeline as named resources:
+
+### How It Works
+
+1. **Resources are Created**: Scripts write files to `$OUTPUT_DIR`, which is a FUSE mount. The filename becomes the resource name.
+   ```bash
+   echo "data" > $OUTPUT_DIR/my-dataset  # Creates resource named "my-dataset"
+   ```
+
+2. **Tasks are Scheduled**: When a step has an `inputs` filter, only resources matching that name trigger task creation.
+   ```toml
+   [[step]]
+   name = "processor"
+   inputs = "my-dataset"  # Only processes resources named "my-dataset"
+   ```
+
+3. **Incremental Processing**: The `GetUnconsumedResources()` method finds resources that haven't been processed by a step yet, enabling incremental pipelines.
+
+4. **Seed Tasks**: Start steps (with `start = true`) execute once with no input (`INPUT_FILE` is empty) to bootstrap the pipeline.
+
+5. **Content Deduplication**: Resources with identical content (same SHA-256 hash) are stored only once in BadgerDB, saving disk space.
+
+### Example Data Flow
+```
+Start Step
+  └─> Writes "raw-data" resource
+        └─> Step with inputs="raw-data" processes it
+              └─> Writes "processed" resource
+                    └─> Step with inputs="processed" processes it
+                          └─> Writes "final" resource
+```
 
 ## Usage
 
@@ -274,9 +345,11 @@ task-pipeline -manifest <path-to-manifest.toml> -db <database-directory> [option
 - `-manifest` (required): Path to the TOML manifest file defining steps
 - `-db` (default: `./db`): Directory for database and object storage
 - `-run`: Execute the pipeline
-- `-migrate-tainted`: Detect steps with changed scripts and migrate their tasks to new versions
 - `-parallel` (default: number of CPUs): Maximum concurrent tasks to execute
 - `-start`: Name of the step to start from (defaults to step with `start=true`)
+- `-step`: Filter to specific steps (can be repeated multiple times for multiple steps)
+- `-export`: List all resource hashes for a given resource name
+- `-export-hash`: Stream resource content by hash to stdout (for extracting pipeline outputs)
 - `-verbose`: Enable detailed logging with task information, script details, and input/output operations
 - `-quiet`: Minimal output mode (only critical errors, overrides verbose)
 
@@ -289,12 +362,13 @@ Create a TOML file with step definitions:
 name = "extract"
 start = true
 script = """
-# Initial step - generates output files
+# Initial step - generates output files (resources)
 curl https://api.example.com/data > $OUTPUT_DIR/data
 """
 
 [[step]]
 name = "process"
+inputs = "data"  # Only process resources named "data"
 script = """
 # Process the data and generate output
 process-tool < $INPUT_FILE > $OUTPUT_DIR/result
@@ -302,6 +376,8 @@ process-tool < $INPUT_FILE > $OUTPUT_DIR/result
 
 [[step]]
 name = "transform"
+inputs = "result"  # Only process resources named "result"
+parallel = 2      # Limit this step to 2 parallel tasks
 script = """
 # Transform and output to next step
 transform-tool < $INPUT_FILE > $OUTPUT_DIR/final
@@ -311,87 +387,118 @@ transform-tool < $INPUT_FILE > $OUTPUT_DIR/final
 ### Environment Variables for Scripts
 
 Each step script receives:
-- `INPUT_FILE`: Path to the input file (previous step's output or empty for start step)
-- `OUTPUT_DIR`: Directory where the script should write output files
+- `INPUT_FILE`: Path to the input file (from previous step's resource, or empty for start step)
+- `OUTPUT_DIR`: Path to a FUSE-mounted directory where the script writes output files
 
-Output filenames determine which step processes them next. For example:
-- `result_next.txt` → routes to `next` step
-- `final_transform.txt` → routes to `transform` step
-- `done.txt` → final output (no further processing)
+**Resource Naming:** Output filenames become resource names. For example:
+- Script writes `$OUTPUT_DIR/dataset-v1` → Creates resource named "dataset-v1"
+- Script writes `$OUTPUT_DIR/results` → Creates resource named "results"
 
-## Step Versioning & Tainted Steps
+**Resource Flow:** Steps can filter which resources they process using the `inputs` field:
+```toml
+[[step]]
+name = "processor"
+inputs = "dataset-v1"  # Only processes resources named "dataset-v1"
+script = "process < $INPUT_FILE > $OUTPUT_DIR/output"
+```
 
-When you modify a step's script in your manifest and run it again, Task Pipeline:
+## Step Versioning & Change Detection
 
-1. Detects the script change and creates a new step version
-2. Identifies "tainted" tasks (those running the old script)
-3. Can automatically migrate and reprocess them with the new script
+When you modify a step's script in your manifest, GRIT automatically handles versioning:
+
+1. **Version Creation**: When a step's script or inputs change, a new version is created in the database
+2. **Tainted Steps**: Database method `GetTaintedSteps()` identifies steps with newer definitions
+3. **Historical Preservation**: Old tasks remain in the database as historical records
+4. **Automatic Handling**: Simply re-run the pipeline - new tasks will use the new version
 
 ### Workflow
 ```bash
 # Initial run
 ./task-pipeline -manifest workflow.toml --db ./db -run
 
-# Edit workflow.toml - change a step's script
+# Edit workflow.toml - change a step's script or inputs
 
-# Detect and migrate tainted steps
-./task-pipeline -manifest workflow.toml --db ./db -migrate-tainted
-
-# Run again - reprocesses with new script
+# Run again - new version is automatically created and used
 ./task-pipeline -manifest workflow.toml --db ./db -run
 ```
 
-Old tasks are preserved as historical records while new tasks reprocess with the updated logic.
+The unique constraint on `(step.name, step.version)` ensures each modification creates a new version while preserving old task executions.
 
 ## Database Schema
 
-### Tables
+### SQLite Tables
 
 - **step**: Step definitions and versions
   - `id`: Auto-increment primary key
   - `name`: Step name
   - `script`: Shell script to execute
-  - `version`: Auto-incrementing version when script changes
-  - `is_start`: Whether this is the starting step
-  - `parallel`: Maximum parallel execution limit
+  - `version`: Auto-incrementing version when script or inputs change
+  - `is_start`: Whether this is the starting step (boolean)
+  - `parallel`: Maximum parallel execution limit (0 = unlimited)
+  - `inputs`: Filter for which resource names this step processes
+  - **Unique constraint**: `(name, version)`
 
 - **task**: Task execution instances
   - `id`: Auto-increment primary key
-  - `object_hash`: SHA-256 hash of the input object
   - `step_id`: Foreign key to step table
-  - `input_task_id`: Foreign key linking to parent task
-  - `processed`: 0/1 flag for completion status
-  - `error`: Error message if task failed
-  - `runset`: Timestamp grouping related tasks
+  - `input_resource_id`: Foreign key to resource table (NULL for seed tasks)
+  - `processed`: Boolean flag (0 = pending, 1 = completed)
+  - `error`: Error message if task failed (NULL if successful)
+  - **Unique constraint**: `(step_id, input_resource_id)`
+
+- **resource**: Resource metadata
+  - `id`: Auto-increment primary key
+  - `name`: Resource identifier (e.g., "dataset-v1", "results")
+  - `object_hash`: SHA-256 hash of content stored in BadgerDB
+  - `created_at`: Timestamp when resource was created
+  - **Unique constraint**: `(name, object_hash)`
+
+### BadgerDB Store
+
+- Key-value store for immutable resource content
+- Keys: SHA-256 hashes (hex encoded)
+- Values: Raw binary content of resources
+- Optimized for batch operations and write-heavy workloads
 
 ### Indexes
 
 - `idx_step_name`: Fast step lookup by name
 - `idx_task_step`: Efficient task filtering by step
 - `idx_task_processed`: Quick filtering of unprocessed tasks
-- `idx_task_input`: Find downstream tasks by input task ID
+- `idx_resource_name`: Fast resource lookup by name
 
 ## Features
 
-- **Content-Addressable Storage**: Deduplicates outputs using SHA-256 hashing
-- **Concurrent Processing**: Handles multiple task streams simultaneously
-- **Persistent State**: Maintains execution history in SQLite
-- **Step Versioning**: Automatically tracks script changes
-- **Tainted Step Migration**: Detects and reprocesses tasks when steps change
-- **Dependency Management**: Links tasks through input/output relationships
-- **WAL Mode**: Enables concurrent reads/writes to the database
+- **Dual-Database Architecture**: SQLite for metadata, BadgerDB for content-addressable object storage
+- **Resource-Based Flow**: Tasks process resources (named outputs from previous steps)
+- **Incremental Processing**: Only creates tasks for unconsumed resources (avoids redundant work)
+- **Write-Only FUSE**: Scripts write outputs to FUSE filesystem, ensuring isolation
+- **Concurrent Processing**: Configurable parallel task execution with worker pools
+- **Persistent State**: Maintains execution history in SQLite, immutable objects in BadgerDB
+- **Step Versioning**: Automatically tracks script and input changes
+- **Content Deduplication**: SHA-256 hashing prevents storing duplicate objects
+- **Seed Tasks**: Start steps execute with NULL input to initialize pipelines
+- **Step Filtering**: Run specific subset of steps via `-step` flag
+- **Batch Operations**: Efficient batch read/write to BadgerDB
+- **Graceful Shutdown**: FUSE filesystems unmount cleanly with timeout + force-flush
 - **Shell Script Flexibility**: Execute any shell command or script
+- **Export Functionality**: Extract resources by name or hash for external use
+- **Disk Space Monitoring**: Warns when disk usage exceeds 85%
+- **Flexible Logging**: Three levels (Quiet, Normal, Verbose) with color-coded output
 
 ## Dependencies
 
-- `github.com/danhab99/idk/chans`: Channel utilities for stream merging
+- `github.com/danhab99/idk/chans`: Unbounded channel utilities for stream merging
 - `github.com/danhab99/idk/workers`: Worker pool for parallel processing
-- `github.com/pelletier/go-toml`: TOML parsing
+- `github.com/pelletier/go-toml`: TOML parsing for manifest files
 - `github.com/fatih/color`: Terminal color output
 - `github.com/schollz/progressbar/v3`: Progress bar visualization
-- `database/sql`: SQLite database access
-- `github.com/mattn/go-sqlite3`: SQLite driver
-- Standard Go libraries
+- `github.com/mattn/go-sqlite3`: SQLite database driver
+- `github.com/dgraph-io/badger/v4`: BadgerDB key-value store
+- `github.com/hanwen/go-fuse/v2`: FUSE filesystem implementation
+- `github.com/fsnotify/fsnotify`: File system event notifications
+- `github.com/alecthomas/chroma`: Syntax highlighting for output
+- Standard Go libraries (`database/sql`, `crypto/sha256`, `os/exec`, etc.)
 
 ## Example Workflow
 
@@ -400,11 +507,24 @@ Old tasks are preserved as historical records while new tasks reprocess with the
 [[step]]
 name = "fetch"
 start = true
-script = "echo 'sample data' > $OUTPUT_DIR/process"
+script = """
+echo 'sample data' > $OUTPUT_DIR/raw-data
+echo 'more samples' > $OUTPUT_DIR/raw-data-2
+"""
 
 [[step]]
 name = "process"
-script = "tr '[:lower:]' '[:upper:]' < $INPUT_FILE > $OUTPUT_DIR/done"
+inputs = "raw-data"  # Only process resources named "raw-data"
+script = """
+tr '[:lower:]' '[:upper:]' < $INPUT_FILE > $OUTPUT_DIR/processed
+"""
+
+[[step]]
+name = "finalize"
+inputs = "processed"  # Only process resources named "processed"
+script = """
+cat $INPUT_FILE | sort > $OUTPUT_DIR/final
+"""
 ```
 
 2. Run the pipeline:
@@ -412,19 +532,27 @@ script = "tr '[:lower:]' '[:upper:]' < $INPUT_FILE > $OUTPUT_DIR/done"
 ./task-pipeline -manifest workflow.toml -db ./my-db -run
 ```
 
-3. Modify the process step in workflow.toml:
+3. Export the final results:
+```bash
+# List all "final" resource hashes
+./task-pipeline -manifest workflow.toml -db ./my-db -export final
+
+# Export specific resource by hash
+./task-pipeline -manifest workflow.toml -db ./my-db -export-hash <hash> > output.txt
+```
+
+4. Modify the process step in workflow.toml:
 ```toml
 [[step]]
 name = "process"
-script = "tr '[:lower:]' '[:upper:]' < $INPUT_FILE | sort > $OUTPUT_DIR/done"
+inputs = "raw-data"
+script = """
+# Added additional processing
+tr '[:lower:]' '[:upper:]' < $INPUT_FILE | rev > $OUTPUT_DIR/processed
+"""
 ```
 
-4. Migrate tainted tasks:
-```bash
-./task-pipeline -manifest workflow.toml -db ./my-db -migrate-tainted
-```
-
-5. Run again to reprocess with new logic:
+5. Run again - new version is automatically created:
 ```bash
 ./task-pipeline -manifest workflow.toml -db ./my-db -run
 ```
@@ -435,25 +563,33 @@ The program provides intelligent logging based on your chosen output mode:
 
 ### Normal Mode Output
 - Manifest loading and step count
-- Database initialization  
-- Tainted step detection and migration counts
+- Database initialization (SQLite + BadgerDB)
+- Disk space warnings
 - Step execution with colored indicators
 - Real-time progress bars for each step
-- Task completion counts
-- Execution summary with statistics
+- Task completion counts with statistics
+- Resource creation notifications
+- Execution summary with total duration
 
 ### Verbose Mode Output  
 Everything in Normal mode plus:
-- Step registration details
-- Database operation details
+- Step registration details with version info
+- Database operation details (task scheduling, resource lookups)
 - Input/output file paths and byte counts
 - Script commands being executed
 - Script stdout/stderr output in real-time
 - Individual task processing information
+- FUSE mount/unmount operations
 
 ### Quiet Mode Output
-- Only critical errors
-- No progress indicators
-- Suitable for CI/CD logs
+- Only critical errors and failures
+- No progress indicators or status updates
+- Suitable for CI/CD and automated environments
 
-For complete details about visibility features, see [VISIBILITY.md](VISIBILITY.md)
+### TaskTracker Output
+- Nix-style build output formatting
+- Grouped task logs per step
+- Collapsible output sections
+- Color-coded success/failure indicators
+
+For complete details about visibility features, see the Logger component documentation.
