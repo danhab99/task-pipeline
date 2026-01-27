@@ -1,0 +1,23 @@
+# show multiple downstream steps consuming the same parent
+
+[[step]]
+name = "start"
+start = true
+script = '''
+echo "banana" > $OUTPUT_DIR/upper
+echo "banana" > $OUTPUT_DIR/sort
+'''
+
+[[step]]
+name = "upper"
+inputs = ["start"]
+script = '''
+tr '[:lower:]' '[:upper:]' < $INPUT_FILE > $OUTPUT_DIR/done
+'''
+
+[[step]]
+name = "sort"
+inputs = ["start"]
+script = '''
+sort < $INPUT_FILE > $OUTPUT_DIR/done
+'''

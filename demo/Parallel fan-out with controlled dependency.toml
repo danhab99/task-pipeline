@@ -1,0 +1,17 @@
+[[step]]
+name = "generate"
+start = true
+script = '''
+for i in $(seq 1 8); do
+  echo "$i" > $OUTPUT_DIR/work
+done
+'''
+
+[[step]]
+name = "work"
+inputs = ["generate"]
+parallel = 4
+script = '''
+sleep 1
+awk '{print $1 * $1}' < $INPUT_FILE > $OUTPUT_DIR/done
+'''

@@ -1,0 +1,15 @@
+# This is a DAG, not magic filenames
+
+[[step]]
+name = "extract"
+start = true
+script = '''
+echo "hello world" > $OUTPUT_DIR/process
+'''
+
+[[step]]
+name = "process"
+inputs = ["extract"]
+script = '''
+tr '[:lower:]' '[:upper:]' < $INPUT_FILE > $OUTPUT_DIR/done
+'''
