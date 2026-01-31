@@ -3,11 +3,9 @@ package main
 import (
 	"slices"
 	"time"
-
-	"github.com/fatih/color"
 )
 
-var runLogger = NewColorLogger("[RUN] ", color.New(color.FgBlue, color.Bold))
+var runLogger = NewLogger("RUN")
 
 func run(manifest Manifest, database Database, parallel int, startStepName string, enabledSteps []string) {
 	startTime := time.Now()
@@ -39,7 +37,7 @@ func run(manifest Manifest, database Database, parallel int, startStepName strin
 		}
 	}
 
-	runLogger.Printf("Registered %d steps", len(manifest.Steps))
+	runLogger.Printf("Registered %d steps\n", len(manifest.Steps))
 
 	// Create pipeline with single FUSE server
 	pipeline, err := NewPipeline(&database)
@@ -48,7 +46,7 @@ func run(manifest Manifest, database Database, parallel int, startStepName strin
 	}
 	defer pipeline.fuseWatcher.Stop()
 
-	runLogger.Printf("FUSE server started at: %s", pipeline.GetFusePath())
+	runLogger.Printf("FUSE server started at: %s\n", pipeline.GetFusePath())
 
 	// Check if we need to seed
 	resourceCount, err := database.CountResources()
@@ -57,7 +55,7 @@ func run(manifest Manifest, database Database, parallel int, startStepName strin
 	}
 
 	if resourceCount == 0 {
-		runLogger.Printf("No resources found, running seed step")
+		runLogger.Printf("No resources found, running seed step\n")
 		startStep, err := database.GetStartingStep()
 		if err != nil {
 			panic(err)
@@ -89,7 +87,7 @@ func run(manifest Manifest, database Database, parallel int, startStepName strin
 		if execErr != nil {
 			msg := execErr.Error()
 			errorMsg = &msg
-			runLogger.Errorf("Seed task failed: %v", execErr)
+			runLogger.Printf("Seed task failed: %v\n", execErr)
 		}
 
 		err = database.UpdateTaskStatus(seedTask.ID, true, errorMsg)
@@ -98,7 +96,7 @@ func run(manifest Manifest, database Database, parallel int, startStepName strin
 		}
 
 		if execErr == nil {
-			runLogger.Successf("Seed task completed")
+			runLogger.Printf("Seed task completed\n")
 		}
 
 		if len(steps) >= 1 {
@@ -113,10 +111,10 @@ func run(manifest Manifest, database Database, parallel int, startStepName strin
 		totalExecutions += executions
 
 		if executions > 0 {
-			runLogger.Printf("Step %s: executed %d tasks", step.Name, executions)
+			runLogger.Printf("Step %s: executed %d tasks\n", step.Name, executions)
 		}
 	}
 
 	duration := time.Since(startTime)
-	runLogger.Successf("Pipeline complete: %d tasks executed in %s", totalExecutions, duration.Round(time.Millisecond))
+	runLogger.Printf("Pipeline complete: %d tasks executed in %s\n", totalExecutions, duration.Round(time.Millisecond))
 }

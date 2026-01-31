@@ -1,7 +1,6 @@
 package main
 
 import (
-	"log"
 	"os"
 	"runtime"
 	"sync/atomic"
@@ -9,7 +8,7 @@ import (
 	"github.com/danhab99/idk/workers"
 )
 
-var pipelineLogger = log.New(os.Stderr, "[PIPELINE] ", log.Ldate|log.Ltime|log.Lmsgprefix)
+var pipelineLogger = NewLogger("PIPELINE")
 
 type Pipeline struct {
 	db          *Database
@@ -43,12 +42,12 @@ func (p *Pipeline) ExecuteStep(step Step, maxParallel int) int64 {
 	// Schedule new tasks for this step
 	tasksCreated, err := db.ScheduleTasksForStep(step.ID)
 	if err != nil {
-		pipelineLogger.Printf("Error scheduling tasks for step %s: %v", step.Name, err)
+		pipelineLogger.Printf("Error scheduling tasks for step %s: %v\n", step.Name, err)
 		return 0
 	}
 
 	if tasksCreated > 0 {
-		pipelineLogger.Printf("Step %s: scheduled %d new tasks", step.Name, tasksCreated)
+		pipelineLogger.Printf("Step %s: scheduled %d new tasks\n", step.Name, tasksCreated)
 	}
 
 	// Execute unprocessed tasks
@@ -62,7 +61,7 @@ func (p *Pipeline) ExecuteStep(step Step, maxParallel int) int64 {
 		pr = &x
 	}
 	workers.Parallel0(taskChan, *pr, func(task Task) {
-		pipelineLogger.Printf("Executing task %d for step %s", task.ID, step.Name)
+		pipelineLogger.Printf("Executing task %d for step %s\n", task.ID, step.Name)
 
 		execErr := executor.Execute(task, step, p.outputChan)
 
@@ -70,12 +69,12 @@ func (p *Pipeline) ExecuteStep(step Step, maxParallel int) int64 {
 		if execErr != nil {
 			msg := execErr.Error()
 			errorMsg = &msg
-			pipelineLogger.Printf("Task %d failed: %v", task.ID, execErr)
+			pipelineLogger.Printf("Task %d failed: %v\n", task.ID, execErr)
 		}
 
 		err = db.UpdateTaskStatus(task.ID, true, errorMsg)
 		if err != nil {
-			pipelineLogger.Printf("Error updating task %d: %v", task.ID, err)
+			pipelineLogger.Printf("Error updating task %d: %v\n", task.ID, err)
 		}
 
 		executionCount.Add(1)

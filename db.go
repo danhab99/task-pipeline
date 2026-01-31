@@ -7,14 +7,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"os"
+	"strings"
 
 	badger "github.com/dgraph-io/badger/v4"
 	_ "github.com/mattn/go-sqlite3"
 )
 
-var dbLogger = log.New(os.Stderr, "[DB] ", log.Ldate|log.Ltime|log.Lmsgprefix)
+var dbLogger = NewLogger("DB")
 
 const schema string = `
 CREATE TABLE IF NOT EXISTS step (
@@ -104,12 +104,12 @@ func NewDatabase(repo_path string) (Database, error) {
 		return Database{}, err
 	}
 
-	err = os.MkdirAll(repo_path + "/sqlite", 0755)
+	err = os.MkdirAll(repo_path+"/sqlite", 0755)
 	if err != nil {
 		return Database{}, err
 	}
 
-	dbLogger.Printf("Opening database at %s/db", repo_path)
+	dbLogger.Printf("Opening database at %s/db\n", repo_path)
 	db, err := sql.Open("sqlite3", fmt.Sprintf("%s/sqlite/db?timeout=600000", repo_path))
 	if err != nil {
 		return Database{}, err
@@ -139,7 +139,7 @@ func NewDatabase(repo_path string) (Database, error) {
 	// Force checkpoint
 	_, err = db.Exec("PRAGMA optimize;")
 	if err != nil {
-		dbLogger.Printf("Warning: PRAGMA optimize failed: %v", err)
+		dbLogger.Printf("Warning: PRAGMA optimize failed: %v\n", err)
 	}
 
 	dbLogger.Println("Initializing database schema")
@@ -150,7 +150,7 @@ func NewDatabase(repo_path string) (Database, error) {
 
 	// Initialize BadgerDB for object storage
 	badgerPath := fmt.Sprintf("%s/objects_db", repo_path)
-	dbLogger.Printf("Opening BadgerDB at %s", badgerPath)
+	dbLogger.Printf("Opening BadgerDB at %s\n", badgerPath)
 	badgerOpts := badger.DefaultOptions(badgerPath)
 	badgerOpts.Logger = nil // Disable BadgerDB's default logging
 
@@ -366,7 +366,7 @@ func (d Database) ListSteps() chan Step {
 			}
 			if inputsJSON.Valid && inputsJSON.String != "" {
 				if err := json.Unmarshal([]byte(inputsJSON.String), &step.Inputs); err != nil {
-					dbLogger.Printf("Warning: failed to unmarshal inputs for step %d: %v", step.ID, err)
+					dbLogger.Printf("Warning: failed to unmarshal inputs for step %d: %v\n", step.ID, err)
 				}
 			}
 			stepChan <- step
@@ -414,7 +414,7 @@ func (d Database) GetTaintedSteps() chan Step {
 			}
 			if inputsJSON.Valid && inputsJSON.String != "" {
 				if err := json.Unmarshal([]byte(inputsJSON.String), &step.Inputs); err != nil {
-					dbLogger.Printf("Warning: failed to unmarshal inputs for step %d: %v", step.ID, err)
+					dbLogger.Printf("Warning: failed to unmarshal inputs for step %d: %v\n", step.ID, err)
 				}
 			}
 			stepChan <- step
@@ -516,7 +516,7 @@ func (d Database) GetResourcesByName(name string) chan Resource {
 
 		rows, err := d.db.Query("SELECT id, name, object_hash, created_at FROM resource WHERE name = ? ORDER BY created_at DESC", name)
 		if err != nil {
-			dbLogger.Printf("Error querying resources by name %s: %v", name, err)
+			dbLogger.Printf("Error querying resources by name %s: %v\n", name, err)
 			return
 		}
 		defer rows.Close()
@@ -524,14 +524,14 @@ func (d Database) GetResourcesByName(name string) chan Resource {
 		for rows.Next() {
 			var r Resource
 			if err := rows.Scan(&r.ID, &r.Name, &r.ObjectHash, &r.CreatedAt); err != nil {
-				dbLogger.Printf("Error scanning resource: %v", err)
+				dbLogger.Printf("Error scanning resource: %v\n", err)
 				return
 			}
 			resourceChan <- r
 		}
 
 		if err := rows.Err(); err != nil {
-			dbLogger.Printf("Error iterating resources: %v", err)
+			dbLogger.Printf("Error iterating resources: %v\n", err)
 		}
 	}()
 
@@ -552,7 +552,7 @@ func (d Database) GetAllResources() chan Resource {
 
 		rows, err := d.db.Query("SELECT id, name, object_hash, created_at FROM resource ORDER BY created_at DESC")
 		if err != nil {
-			dbLogger.Printf("Error querying all resources: %v", err)
+			dbLogger.Printf("Error querying all resources: %v\n", err)
 			return
 		}
 		defer rows.Close()
@@ -560,14 +560,14 @@ func (d Database) GetAllResources() chan Resource {
 		for rows.Next() {
 			var r Resource
 			if err := rows.Scan(&r.ID, &r.Name, &r.ObjectHash, &r.CreatedAt); err != nil {
-				dbLogger.Printf("Error scanning resource: %v", err)
+				dbLogger.Printf("Error scanning resource: %v\n", err)
 				return
 			}
 			resourceChan <- r
 		}
 
 		if err := rows.Err(); err != nil {
-			dbLogger.Printf("Error iterating resources: %v", err)
+			dbLogger.Printf("Error iterating resources: %v\n", err)
 		}
 	}()
 
@@ -593,7 +593,7 @@ func (d Database) GetUnconsumedResourcesByName(name string, consumingStepID int6
 			ORDER BY r.created_at DESC
 		`, name, consumingStepID)
 		if err != nil {
-			dbLogger.Printf("Error querying unconsumed resources for name %s, step %d: %v", name, consumingStepID, err)
+			dbLogger.Printf("Error querying unconsumed resources for name %s, step %d: %v\n", name, consumingStepID, err)
 			return
 		}
 		defer rows.Close()
@@ -601,14 +601,14 @@ func (d Database) GetUnconsumedResourcesByName(name string, consumingStepID int6
 		for rows.Next() {
 			var r Resource
 			if err := rows.Scan(&r.ID, &r.Name, &r.ObjectHash, &r.CreatedAt); err != nil {
-				dbLogger.Printf("Error scanning resource: %v", err)
+				dbLogger.Printf("Error scanning resource: %v\n", err)
 				return
 			}
 			resourceChan <- r
 		}
 
 		if err := rows.Err(); err != nil {
-			dbLogger.Printf("Error iterating resources: %v", err)
+			dbLogger.Printf("Error iterating resources: %v\n", err)
 		}
 	}()
 
@@ -757,7 +757,7 @@ func (d Database) ScheduleTasksForStep(stepID int64) (int64, error) {
 	}
 
 	if len(step.Inputs) == 0 {
-		dbLogger.Printf("Step %d (%s) has no inputs, skipping scheduling", stepID, step.Name)
+		dbLogger.Printf("Step %d (%s) has no inputs, skipping scheduling\n", stepID, step.Name)
 		return 0, nil
 	}
 
@@ -767,7 +767,7 @@ func (d Database) ScheduleTasksForStep(stepID int64) (int64, error) {
 		return 0, fmt.Errorf("failed to marshal inputs: %w", err)
 	}
 
-	dbLogger.Printf("Scheduling tasks for step %d (%s) with inputs: %s", stepID, step.Name, string(inputsJSON))
+	dbLogger.Printf("Scheduling tasks for step %d (%s) with inputs: %s\n", stepID, step.Name, string(inputsJSON))
 
 	// Single SQL statement to create tasks for all unconsumed resources
 	// that match the step's input names
@@ -793,9 +793,9 @@ func (d Database) ScheduleTasksForStep(stepID int64) (int64, error) {
 	}
 
 	if rowsAffected > 0 {
-		dbLogger.Printf("Scheduled %d new tasks for step %d (%s)", rowsAffected, stepID, step.Name)
+		dbLogger.Printf("Scheduled %d new tasks for step %d (%s)\n", rowsAffected, stepID, step.Name)
 	} else {
-		dbLogger.Printf("No new tasks scheduled for step %d (%s) - no matching unconsumed resources", stepID, step.Name)
+		dbLogger.Printf("No new tasks scheduled for step %d (%s) - no matching unconsumed resources\n", stepID, step.Name)
 	}
 
 	return rowsAffected, nil
@@ -860,7 +860,7 @@ func (d Database) MarkStepUndone(stepID int64) error {
 		return err
 	}
 
-	dbLogger.Printf("Marked step %d as undone: deleted %d tasks and their resources", stepID, tasksDeleted)
+	dbLogger.Printf("Marked step %d as undone: deleted %d tasks and their resources\n", stepID, tasksDeleted)
 	return nil
 }
 
@@ -995,7 +995,7 @@ func (d Database) CheckAndMarkStepComplete(stepID int64) (bool, error) {
 			if err != nil {
 				return false, err
 			}
-			dbLogger.Printf("Step %d (%s) marked as complete", stepID, step.Name)
+			dbLogger.Printf("Step %d (%s) marked as complete\n", stepID, step.Name)
 		}
 	}
 
@@ -1029,7 +1029,7 @@ func (d Database) GetUnprocessedTasks(stepID int64) chan Task {
 		defer close(taskChan)
 		var taskCount int64 = 0
 		defer func() {
-			dbLogger.Printf("GetUnprocessedTasks(step=%d) found %d unprocessed tasks", stepID, taskCount)
+			dbLogger.Printf("GetUnprocessedTasks(step=%d) found %d unprocessed tasks\n", stepID, taskCount)
 		}()
 
 		// Get all unprocessed tasks for this step
@@ -1041,7 +1041,7 @@ func (d Database) GetUnprocessedTasks(stepID int64) chan Task {
 			ORDER BY t.id
 		`, stepID)
 		if err != nil {
-			dbLogger.Printf("Error querying unprocessed tasks for step %d: %v", stepID, err)
+			dbLogger.Printf("Error querying unprocessed tasks for step %d: %v\n", stepID, err)
 			return
 		}
 		defer rows.Close()
@@ -1049,7 +1049,7 @@ func (d Database) GetUnprocessedTasks(stepID int64) chan Task {
 		for rows.Next() {
 			var t Task
 			if err := rows.Scan(&t.ID, &t.StepID, &t.InputResourceID, &t.Processed, &t.Error); err != nil {
-				dbLogger.Printf("Error scanning task for step %d: %v", stepID, err)
+				dbLogger.Printf("Error scanning task for step %d: %v\n", stepID, err)
 				return
 			}
 			taskCount++
@@ -1057,7 +1057,7 @@ func (d Database) GetUnprocessedTasks(stepID int64) chan Task {
 		}
 
 		if err := rows.Err(); err != nil {
-			dbLogger.Printf("Error iterating tasks for step %d: %v", stepID, err)
+			dbLogger.Printf("Error iterating tasks for step %d: %v\n", stepID, err)
 		}
 	}()
 
@@ -1152,7 +1152,7 @@ func (d Database) ForceSaveWAL() error {
 	dbLogger.Println("Checkpointing WAL...")
 	_, err := d.db.Exec("PRAGMA wal_checkpoint(RESTART);")
 	if err != nil {
-		dbLogger.Printf("Error checkpointing WAL: %v", err)
+		dbLogger.Printf("Error checkpointing WAL: %v\n", err)
 		return err
 	}
 	dbLogger.Println("WAL checkpoint complete")
@@ -1176,12 +1176,13 @@ func (db Database) MakeResourceConsumer() chan FileData {
 	// Single FUSE server collects all resources
 	go func() {
 		for data := range outputChan {
-			_, hash, err := db.CreateResourceFromReader(data.Name, data.Reader)
+			resourceName := strings.Split(data.Name, "_")[0]
+			_, hash, err := db.CreateResourceFromReader(resourceName, data.Reader)
 			if err != nil {
-				pipelineLogger.Printf("Error creating resource %s: %v", data.Name, err)
+				pipelineLogger.Printf("Error creating resource %s: %v\n", data.Name, err)
 				continue
 			}
-			pipelineLogger.Printf("Created resource %s (hash: %s)", data.Name, hash[:16]+"...")
+			pipelineLogger.Printf("Created resource %s (hash: %s)\n", data.Name, hash[:16]+"...")
 		}
 	}()
 

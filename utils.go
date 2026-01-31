@@ -21,7 +21,7 @@ func checkDiskSpace(dbPath string) {
 	percentUsed := (usedGB / totalGB) * 100
 
 	if percentUsed > 85 {
-		mainLogger.Warnf("⚠️  Disk %s is %.1f%% full (%.1fGB free / %.1fGB total). This may cause database slowness.", dbPath, percentUsed, availableGB, totalGB)
+		mainLogger.Printf("⚠️  Disk %s is %.1f%% full (%.1fGB free / %.1fGB total). This may cause database slowness.\n", dbPath, percentUsed, availableGB, totalGB)
 	}
 }
 

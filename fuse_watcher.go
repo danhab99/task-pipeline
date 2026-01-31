@@ -3,7 +3,6 @@ package main
 import (
 	"io"
 	"io/fs"
-	"log"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -38,7 +37,7 @@ type fileData struct {
 	mu      sync.Mutex
 }
 
-var fuseLogger = log.New(os.Stderr, "[FUSE]", LOG_FLAGS)
+var fuseLogger = NewLogger("FUSE")
 
 // NewFuseWatcher creates a new FUSE watcher that mounts at the specified path
 // Backpressure is controlled by the capacity of outputChan
@@ -91,7 +90,7 @@ func (fw *FuseWatcher) Entries() <-chan fs.DirEntry {
 
 // Start begins serving the FUSE filesystem
 func (fw *FuseWatcher) Start() {
-	fuseLogger.Printf("Starting server at %s", fw.mountPath)
+	fuseLogger.Printf("Starting server at %s\n", fw.mountPath)
 	go fw.server.Serve()
 }
 
@@ -115,7 +114,7 @@ func (fw *FuseWatcher) Stop() error {
 	fw.closed = true
 	fw.mu.Unlock()
 
-	fuseLogger.Printf("Stopping server at %s", fw.mountPath)
+	fuseLogger.Printf("Stopping server at %s\n", fw.mountPath)
 
 	// Wait for any open files to be closed (with timeout)
 	done := make(chan struct{})
@@ -127,12 +126,12 @@ func (fw *FuseWatcher) Stop() error {
 	select {
 	case <-done:
 		// All files closed normally
-		fuseLogger.Printf("All files closed gracefully")
+		fuseLogger.Printf("All files closed gracefully\n")
 	case <-time.After(2 * time.Second):
 		// Timeout - force process remaining files
 		remaining := fw.openFilesCount.Load()
 		if remaining > 0 {
-			fuseLogger.Printf("Timeout waiting for %d open files, force processing", remaining)
+			fuseLogger.Printf("Timeout waiting for %d open files, force processing\n", remaining)
 			fw.forceProcessFiles()
 		}
 	}
@@ -140,7 +139,7 @@ func (fw *FuseWatcher) Stop() error {
 	// Unmount the filesystem
 	err := fw.server.Unmount()
 	if err != nil {
-		fuseLogger.Printf("Error unmounting: %v", err)
+		fuseLogger.Printf("Error unmounting: %v\n", err)
 	}
 
 	// Close channels
@@ -148,11 +147,11 @@ func (fw *FuseWatcher) Stop() error {
 
 	// Clean up the mount directory
 	if err := os.RemoveAll(fw.mountPath); err != nil {
-		fuseLogger.Printf("Error removing mount directory %s: %v", fw.mountPath, err)
+		fuseLogger.Printf("Error removing mount directory %s: %v\n", fw.mountPath, err)
 		return err
 	}
 
-	fuseLogger.Printf("Cleaned up mount directory %s", fw.mountPath)
+	fuseLogger.Printf("Cleaned up mount directory %s\n", fw.mountPath)
 	return nil
 }
 
@@ -179,9 +178,9 @@ func (fw *FuseWatcher) forceProcessFiles() {
 				reader := &bytesReader{data: content}
 				select {
 				case fw.outputChan <- FileData{Name: name, Reader: reader}:
-					fuseLogger.Printf("Force-processed file: %s", name)
+					fuseLogger.Printf("Force-processed file: %s\n", name)
 				case <-time.After(1 * time.Second):
-					fuseLogger.Printf("Timeout sending file %s to channel", name)
+					fuseLogger.Printf("Timeout sending file %s to channel\n", name)
 				}
 			}
 		} else {

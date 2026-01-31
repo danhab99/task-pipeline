@@ -7,7 +7,6 @@ import (
 	"os"
 	"runtime"
 
-	"github.com/fatih/color"
 	"github.com/pelletier/go-toml"
 )
 
@@ -24,7 +23,7 @@ func (s *stringSlice) Set(value string) error {
 	return nil
 }
 
-var mainLogger = NewColorLogger("[MAIN] ", color.New(color.FgMagenta, color.Bold))
+var mainLogger = NewLogger("MAIN")
 
 func main() {
 	manifest_path := flag.String("manifest", "", "manifest path")
@@ -34,24 +33,13 @@ func main() {
 	exportHash := flag.String("export-hash", "", "export file content by hash")
 	runPipeline := flag.Bool("run", false, "run the pipeline")
 	startStep := flag.String("start", "", "step to start from (optional, defaults to start step in manifest)")
-	verbose := flag.Bool("verbose", false, "enable verbose logging")
-	quiet := flag.Bool("quiet", false, "minimal output (overrides verbose)")
 
 	var enabledSteps stringSlice
 	flag.Var(&enabledSteps, "step", "steps to run")
 
 	flag.Parse()
 
-	// Set log level based on flags
-	if *quiet {
-		SetLogLevel(LogLevelQuiet)
-	} else if *verbose {
-		SetLogLevel(LogLevelVerbose)
-	} else {
-		SetLogLevel(LogLevelNormal)
-	}
-
-	mainLogger.Printf("Loading manifest from: %s", *manifest_path)
+	mainLogger.Printf("Loading manifest from: %s\n", *manifest_path)
 
 	manifest_toml, err := os.ReadFile(*manifest_path)
 	if err != nil {
@@ -63,12 +51,12 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	mainLogger.Successf("Loaded %d steps from manifest", len(manifest.Steps))
+	mainLogger.Printf("Loaded %d steps from manifest\n", len(manifest.Steps))
 
 	// Check disk space before opening database
 	checkDiskSpace(*db_path)
 
-	mainLogger.Verbosef("Initializing database at: %s", *db_path)
+	mainLogger.Printf("Initializing database at: %s\n", *db_path)
 	database, err := NewDatabase(*db_path)
 	if err != nil {
 		panic(err)

@@ -7,10 +7,10 @@ import (
 	"github.com/fatih/color"
 )
 
-var exportLogger = NewColorLogger("[EXPORT] ", color.New(color.FgGreen, color.Bold))
+var exportLogger = NewLogger("EXPORT")
 
 func exportResourcesByName(database Database, resourceName string) {
-	exportLogger.Printf("Listing resources with name: %s", color.MagentaString(resourceName))
+	exportLogger.Printf("Listing resources with name: %s\n", color.MagentaString(resourceName))
 
 	// List all resources with the given name
 	resourceCount := 0
@@ -21,31 +21,31 @@ func exportResourcesByName(database Database, resourceName string) {
 	}
 
 	if resourceCount == 0 {
-		exportLogger.Errorf("No resources found with name '%s'", resourceName)
+		exportLogger.Printf("No resources found with name '%s'\n", resourceName)
 		os.Exit(1)
 	} else {
-		exportLogger.Successf("Listed %d resource(s)", resourceCount)
+		exportLogger.Printf("Listed %d resource(s)\n", resourceCount)
 	}
 }
 
 func exportResourceByHash(database Database, hash string) {
-	exportLogger.Printf("Exporting resource with hash: %s", color.MagentaString(hash[:16]+"..."))
+	exportLogger.Printf("Exporting resource with hash: %s\n", color.MagentaString(hash[:16]+"..."))
 
 	// Check if object exists
 	if !database.ObjectExists(hash) {
-		exportLogger.Errorf("Object with hash '%s' not found", hash)
+		exportLogger.Printf("Object with hash '%s' not found\n", hash)
 		os.Exit(1)
 	}
 
 	// Get object data
 	data, err := database.GetObject(hash)
 	if err != nil {
-		exportLogger.Errorf("Failed to get object %s: %v", hash[:16], err)
+		exportLogger.Printf("Failed to get object %s: %v\n", hash[:16], err)
 		os.Exit(1)
 	}
 
 	// Write raw content to stdout
 	os.Stdout.Write(data)
 	
-	exportLogger.Successf("Exported %d bytes", len(data))
+	exportLogger.Printf("Exported %d bytes\n", len(data))
 }

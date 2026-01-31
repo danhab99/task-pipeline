@@ -6,8 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"sync"
-
-	"github.com/fatih/color"
 )
 
 type ScriptExecutor struct {
@@ -22,11 +20,13 @@ func NewScriptExecutor(db *Database, pipeline *Pipeline) *ScriptExecutor {
 	}
 }
 
+var executeLogger = NewLogger("EXEC")
+
 func (e *ScriptExecutor) Execute(task Task, step Step, outputChan chan FileData) error {
-	watcher, err := NewFuseWatcher(mkTemp(), outputChan)
+	watcher, err := NewTempDirFuseWatcher(outputChan)
 	defer watcher.WaitForWrites()
 
-	pipelineLogger.Printf("    Executing task ID=%d for step '%s' (step_id=%d)", task.ID, step.Name, task.StepID)
+	executeLogger.Printf("Executing task ID=%d for step '%s' (step_id=%d)\n", task.ID, step.Name, task.StepID)
 
 	// Create input file
 	inputFile, err := os.CreateTemp("/tmp", "input-*")
@@ -42,7 +42,7 @@ func (e *ScriptExecutor) Execute(task Task, step Step, outputChan chan FileData)
 	inputFile.Close()
 
 	// Execute the script
-	pipelineLogger.Printf("    Executing: %s", step.Script)
+	executeLogger.Printf("Executing: %s\n", step.Script)
 	cmd := e.buildCommand(step, inputFile.Name(), watcher.mountPath)
 
 	// Run script and capture output
@@ -70,9 +70,9 @@ func (e *ScriptExecutor) prepareInput(task Task, inputFile *os.File) error {
 		if err != nil {
 			return fmt.Errorf("failed to write input data: %w", err)
 		}
-		pipelineLogger.Printf("    Input: %d bytes from resource '%s' (hash: %s)", n, inputResource.Name, inputResource.ObjectHash[:16]+"...")
+		executeLogger.Printf("Input: %d bytes from resource '%s' (hash: %s)\n", n, inputResource.Name, inputResource.ObjectHash[:16]+"...")
 	} else {
-		pipelineLogger.Printf("    Input: (empty - start step)")
+		executeLogger.Printf("Input: (empty - start step)\n")
 	}
 
 	return nil
@@ -99,11 +99,11 @@ func (e *ScriptExecutor) runScript(cmd *exec.Cmd, step Step) error {
 	}
 
 	if err := cmd.Start(); err != nil {
-		pipelineLogger.Printf("    Error starting script: %v", err)
+		executeLogger.Printf("Error starting script: %v\n", err)
 		return fmt.Errorf("failed to start script: %w", err)
 	}
 
-	scriptLogger := NewColorLogger(fmt.Sprintf("[SCRIPT:%s] ", step.Name), color.New(color.FgYellow))
+	scriptLogger := NewLogger(fmt.Sprintf("SCRIPT:%s ", step.Name))
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -112,7 +112,7 @@ func (e *ScriptExecutor) runScript(cmd *exec.Cmd, step Step) error {
 		defer wg.Done()
 		scanner := bufio.NewScanner(stdoutPipe)
 		for scanner.Scan() {
-			scriptLogger.Verboseln(scanner.Text())
+			scriptLogger.Printf("[stdout] %s\n", scanner.Text())
 		}
 	}()
 
@@ -120,7 +120,7 @@ func (e *ScriptExecutor) runScript(cmd *exec.Cmd, step Step) error {
 		defer wg.Done()
 		scanner := bufio.NewScanner(stderrPipe)
 		for scanner.Scan() {
-			scriptLogger.Printf("[stderr] %s", scanner.Text())
+			scriptLogger.Printf("[stderr] %s\n", scanner.Text())
 		}
 	}()
 
@@ -131,7 +131,7 @@ func (e *ScriptExecutor) runScript(cmd *exec.Cmd, step Step) error {
 	wg.Wait()
 
 	if err != nil {
-		pipelineLogger.Printf("    Error executing script: %v", err)
+		executeLogger.Printf("Error executing script: %v\n", err)
 		return fmt.Errorf("script execution failed: %w", err)
 	}
 
