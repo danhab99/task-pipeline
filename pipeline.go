@@ -50,6 +50,11 @@ func (p *Pipeline) ExecuteStep(step Step, maxParallel int) int64 {
 		pipelineLogger.Printf("Step %s: scheduled %d new tasks\n", step.Name, tasksCreated)
 	}
 
+	err = db.ForceSaveWAL()
+	if err != nil {
+		panic(err)
+	}
+
 	// Execute unprocessed tasks
 	executor := NewScriptExecutor(db, p)
 	taskChan := db.GetUnprocessedTasks(step.ID)

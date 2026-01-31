@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strings"
 
+	"github.com/danhab99/idk/workers"
 	badger "github.com/dgraph-io/badger/v4"
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -116,12 +118,15 @@ func NewDatabase(repo_path string) (Database, error) {
 	}
 
 	// Set connection pool to reduce lock contention during checkpoint
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	// Use multiple connections so readers/writers can make progress in parallel.
+	numConns := runtime.NumCPU()
+	db.SetMaxOpenConns(numConns)
+	db.SetMaxIdleConns(numConns)
 
 	// Force WAL checkpoint to clear the 173GB log before proceeding
 	dbLogger.Println("Checkpointing WAL file (this may take a moment)...")
-	_, err = db.Exec("PRAGMA busy_timeout = 600000;")
+	// _, err = db.Exec("PRAGMA busy_timeout = 600000;")
+	_, err = db.Exec("PRAGMA busy_timeout = 6;")
 	if err != nil {
 		return Database{}, err
 	}
@@ -463,42 +468,34 @@ func (d Database) CreateResourceFromReader(name string, reader io.Reader) (int64
 }
 
 func (d Database) CreateResource(name string, objectHash string) (int64, error) {
-	// First check if the resource already exists
-	var existingID int64
-	err := d.db.QueryRow(`
-		SELECT id FROM resource 
-		WHERE name = ? AND object_hash = ?
-	`, name, objectHash).Scan(&existingID)
-	if err == nil {
-		// Resource already exists, return its ID
-		return existingID, nil
-	}
-	if err != sql.ErrNoRows {
-		return 0, err
-	}
-
-	// Resource doesn't exist, insert it
-	res, err := d.db.Exec(`
+	// Use an upsert-like pattern to make this safe under concurrency:
+	// INSERT ... ON CONFLICT DO NOTHING, then SELECT the id. This avoids
+	// races where two goroutines attempt to insert the same resource.
+	_, err := d.db.Exec(`
 INSERT INTO resource (name, object_hash)
 VALUES (?, ?)
+ON CONFLICT(name, object_hash) DO NOTHING
 `, name, objectHash)
 	if err != nil {
 		return 0, err
 	}
 
-	id, err := res.LastInsertId()
+	// Now select the id (should exist either from this insert or a concurrent one)
+	var id int64
+	err = d.db.QueryRow("SELECT id FROM resource WHERE name = ? AND object_hash = ? LIMIT 1", name, objectHash).Scan(&id)
 	if err != nil {
 		return 0, err
 	}
-
 	return id, nil
-}
+} 
 
 func (d Database) GetResource(id int64) (*Resource, error) {
 	var r Resource
+	fmt.Println("!!! Getting resource", id)
 	err := d.db.QueryRow("SELECT id, name, object_hash, created_at FROM resource WHERE id = ?", id).Scan(
 		&r.ID, &r.Name, &r.ObjectHash, &r.CreatedAt,
 	)
+	fmt.Println("!!! Getting resource DONE", id)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -1173,17 +1170,82 @@ func (d Database) Close() error {
 func (db Database) MakeResourceConsumer() chan FileData {
 	outputChan := make(chan FileData, 100) // Buffered to prevent deadlock
 
-	// Single FUSE server collects all resources
+	// Jobs for background storage and DB insert
+	type storeJob struct {
+		hash string
+		data []byte
+		name string
+	}
+	type dbJob struct {
+		name string
+		hash string
+	}
+
+	storeChan := make(chan storeJob, runtime.NumCPU())
+	dbJobChan := make(chan dbJob, 100)
+
+	// Worker pool: read FileData, compute hash, and dispatch store + db jobs using workers.Parallel0
+	numWorkers := runtime.NumCPU()
 	go func() {
-		for data := range outputChan {
-			resourceName := strings.Split(data.Name, "_")[0]
-			_, hash, err := db.CreateResourceFromReader(resourceName, data.Reader)
+		workers.Parallel0(outputChan, numWorkers, func(fd FileData) {
+			resourceName := strings.Split(fd.Name, "_")[0]
+			data, err := io.ReadAll(fd.Reader)
 			if err != nil {
-				pipelineLogger.Printf("Error creating resource %s: %v\n", data.Name, err)
-				continue
+				pipelineLogger.Printf("Error reading file %s: %v\n", fd.Name, err)
+				return
 			}
-			pipelineLogger.Printf("Created resource %s (hash: %s)\n", data.Name, hash[:16]+"...")
-		}
+
+			// Compute hash
+			hasher := sha256.New()
+			hasher.Write(data)
+			hash := hex.EncodeToString(hasher.Sum(nil))
+
+			// Enqueue store job; if storeChan is full, spawn a goroutine so the worker doesn't block
+			sj := storeJob{hash: hash, data: data, name: fd.Name}
+			select {
+			case storeChan <- sj:
+				// queued
+			default:
+				go func(s storeJob) {
+					if !db.ObjectExists(s.hash) {
+						if err := db.StoreObject(s.hash, s.data); err != nil {
+							pipelineLogger.Printf("Error storing object %s: %v\n", s.hash[:16]+"...", err)
+						}
+					}
+				}(sj)
+			}
+
+			// Enqueue DB job (should be quick)
+			dbJobChan <- dbJob{name: resourceName, hash: hash}
+		})
+
+		// When output processing finishes, close the downstream channels
+		close(storeChan)
+		close(dbJobChan)
+	}()
+
+	// Store workers using workers.Parallel0
+	numStoreWorkers := 2
+	go func() {
+		workers.Parallel0(storeChan, numStoreWorkers, func(s storeJob) {
+			if !db.ObjectExists(s.hash) {
+				if err := db.StoreObject(s.hash, s.data); err != nil {
+					pipelineLogger.Printf("Error storing object %s: %v\n", s.hash[:16]+"...", err)
+				}
+			}
+		})
+	}()
+
+	// DB inserter (parallel workers to improve SQLite concurrency)
+	numDBWorkers := runtime.NumCPU()
+	go func() {
+		workers.Parallel0(dbJobChan, numDBWorkers, func(j dbJob) {
+			if _, err := db.CreateResource(j.name, j.hash); err != nil {
+				pipelineLogger.Printf("Error creating resource %s: %v\n", j.name, err)
+				return
+			}
+			pipelineLogger.Printf("Created resource %s (hash: %s)\n", j.name, j.hash[:16]+"...")
+		})
 	}()
 
 	return outputChan

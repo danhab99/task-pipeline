@@ -106,14 +106,17 @@ func run(manifest Manifest, database Database, parallel int, startStepName strin
 
 	// Execute all steps
 	var totalExecutions int64
-	for _, step := range steps {
-		executions := pipeline.ExecuteStep(step, parallel)
-		totalExecutions += executions
+	for range 2 {
+		for _, step := range steps {
+			executions := pipeline.ExecuteStep(step, parallel)
+			totalExecutions += executions
 
-		if executions > 0 {
-			runLogger.Printf("Step %s: executed %d tasks\n", step.Name, executions)
+			if executions > 0 {
+				runLogger.Printf("Step %s: executed %d tasks\n", step.Name, executions)
+			}
 		}
 	}
+
 
 	duration := time.Since(startTime)
 	runLogger.Printf("Pipeline complete: %d tasks executed in %s\n", totalExecutions, duration.Round(time.Millisecond))
