@@ -19,9 +19,9 @@
         packages = {
           default = pkgs.buildGoModule {
             pname = "grit";
-            version = "0.2.0";
+            version = "0.2.1";
             src = self;
-            vendorHash = "sha256-lyPVR2ZXBaelbsk/zNxjxgOnrKMUm8shdXW7mXU4ndM=";
+            vendorHash = "sha256-NEWUHUio0oPZdSB9obpZEOD5RQcIsAwnosQg2yESXME=";
             subPackages = [ "." ];
 
             GO_PATH = "${self.outPath}/.go";

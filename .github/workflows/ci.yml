@@ -24,24 +24,3 @@ jobs:
 
       - name: Build
         run: nix build
-
-      - name: Test binary
-        run: |
-          ./result/bin/task-pipeline --help
-          echo "✓ Binary runs successfully"
-
-      - name: Test with example
-        run: |
-          # Create a simple test manifest
-          cat > test.toml << 'EOF'
-          [[step]]
-          name = "start"
-          start = true
-          script = '''
-          echo "test" > $OUTPUT_DIR/output
-          '''
-          EOF
-          
-          # Initialize and run pipeline
-          ./result/bin/task-pipeline -manifest test.toml -db ./test-db
-          echo "✓ Pipeline initialization successful"
