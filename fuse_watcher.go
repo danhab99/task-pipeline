@@ -1,8 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -13,17 +15,32 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse/pathfs"
 )
 
+var fuseWatcherPool chan License
+
+func init() {
+	const LICENSES = 100
+	fuseWatcherPool = make(chan License, LICENSES)
+	for i := range LICENSES {
+		fuseWatcherPool <- License(i)
+	}
+	fmt.Println("Init FUSE licenses")
+
+}
+
+type License int
+
 // FuseWatcher watches a FUSE mount point and consumes files written to it
 type FuseWatcher struct {
-	mountPath       string
-	server          *fuse.Server
-	entries         chan fs.DirEntry
-	mu              sync.Mutex
-	files           map[string]*fileData
-	closed          bool
-	outputChan      chan<- FileData
-	openFiles       sync.WaitGroup // Track open files
-	openFilesCount  atomic.Int64   // Tracks number of open files for monitoring
+	mountPath      string
+	server         *fuse.Server
+	entries        chan fs.DirEntry
+	mu             sync.Mutex
+	files          map[string]*fileData
+	closed         bool
+	outputChan     chan<- FileData
+	openFiles      sync.WaitGroup // Track open files
+	openFilesCount atomic.Int64   // Tracks number of open files for monitoring
+	license        License
 }
 
 // FileData contains the filename and content of a file written to the FUSE mount
@@ -46,6 +63,11 @@ func NewFuseWatcher(mountPath string, outputChan chan<- FileData) (*FuseWatcher,
 		return nil, err
 	}
 
+	license, licenseOk := <-fuseWatcherPool
+	if !(licenseOk) {
+		panic("TOO MANY FUSE WATCHERS")
+	}
+
 	fuseLogger.Println("New FUSE watcher at", mountPath)
 
 	fw := &FuseWatcher{
@@ -53,6 +75,7 @@ func NewFuseWatcher(mountPath string, outputChan chan<- FileData) (*FuseWatcher,
 		entries:    make(chan fs.DirEntry, 100),
 		files:      make(map[string]*fileData),
 		outputChan: outputChan,
+		license:    license,
 	}
 
 	fs := pathfs.NewPathNodeFs(&fuseFS{
@@ -152,6 +175,9 @@ func (fw *FuseWatcher) Stop() error {
 	}
 
 	fuseLogger.Printf("Cleaned up mount directory %s\n", fw.mountPath)
+
+	fuseWatcherPool <- fw.license
+
 	return nil
 }
 
@@ -160,9 +186,7 @@ func (fw *FuseWatcher) forceProcessFiles() {
 	fw.mu.Lock()
 	// Copy the files map
 	filesToProcess := make(map[string]*fileData)
-	for name, data := range fw.files {
-		filesToProcess[name] = data
-	}
+	maps.Copy(filesToProcess, fw.files)
 	fw.mu.Unlock()
 
 	// Process each buffered file
@@ -316,10 +340,10 @@ func (f *fuseFile) Release() {
 	}
 
 	fuseLogger.Printf("release %s\n", f.name)
-	
+
 	// DON'T delete from map - allow file to be opened/written again
 	// Each Create() will replace the entry with fresh data
-	
+
 	// Signal that this file is closed
 	f.watcher.openFilesCount.Add(-1)
 	f.watcher.openFiles.Done()
