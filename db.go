@@ -487,7 +487,7 @@ ON CONFLICT(name, object_hash) DO NOTHING
 		return 0, err
 	}
 	return id, nil
-} 
+}
 
 func (d Database) GetResource(id int64) (*Resource, error) {
 	var r Resource
@@ -1201,19 +1201,7 @@ func (db Database) MakeResourceConsumer() chan FileData {
 			hash := hex.EncodeToString(hasher.Sum(nil))
 
 			// Enqueue store job; if storeChan is full, spawn a goroutine so the worker doesn't block
-			sj := storeJob{hash: hash, data: data, name: fd.Name}
-			select {
-			case storeChan <- sj:
-				// queued
-			default:
-				go func(s storeJob) {
-					if !db.ObjectExists(s.hash) {
-						if err := db.StoreObject(s.hash, s.data); err != nil {
-							pipelineLogger.Printf("Error storing object %s: %v\n", s.hash[:16]+"...", err)
-						}
-					}
-				}(sj)
-			}
+			storeChan <- storeJob{hash: hash, data: data, name: fd.Name}
 
 			// Enqueue DB job (should be quick)
 			dbJobChan <- dbJob{name: resourceName, hash: hash}
