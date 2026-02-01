@@ -96,7 +96,7 @@ func run(manifest Manifest, database Database, parallel int, startStepName strin
 		}
 
 		if execErr == nil {
-			runLogger.Printf("Seed task completed\n")
+			runLogger.Verbosef("Seed task completed\n")
 		}
 
 		if len(steps) >= 1 {

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"time"
 )
 
 type ScriptExecutor struct {
@@ -23,7 +24,9 @@ func NewScriptExecutor(db *Database, pipeline *Pipeline) *ScriptExecutor {
 var executeLogger = NewLogger("EXEC")
 
 func (e *ScriptExecutor) Execute(task Task, step Step, outputChan chan FileData) error {
-	executeLogger.Printf("Executing task ID=%d for step '%s' (step_id=%d)\n", task.ID, step.Name, task.StepID)
+	// executeLogger.Printf("Executing task ID=%d for step '%s' (step_id=%d)\n", task.ID, step.Name, task.StepID)
+
+	start := time.Now()
 
 	// Create input file
 	inputFile, err := os.CreateTemp("/tmp", "input-*")
@@ -39,7 +42,7 @@ func (e *ScriptExecutor) Execute(task Task, step Step, outputChan chan FileData)
 	inputFile.Close()
 
 	// Execute the script
-	executeLogger.Printf("Executing: %s\n", step.Script)
+	executeLogger.Verbosef("Executing: %s\n", step.Script)
 	cmd := e.buildCommand(step, inputFile.Name(), e.pipeline.fuseWatcher.mountPath)
 
 	// Run script and capture output
@@ -47,6 +50,9 @@ func (e *ScriptExecutor) Execute(task Task, step Step, outputChan chan FileData)
 		return err
 	}
 
+	elapsedTime := time.Now().Sub(start)
+
+	executeLogger.Printf("Executed task ID=%d for step '%s' successfully in %s\n", task.ID, step.Name, elapsedTime.String())
 	return nil
 }
 
@@ -67,9 +73,9 @@ func (e *ScriptExecutor) prepareInput(task Task, inputFile *os.File) error {
 		if err != nil {
 			return fmt.Errorf("failed to write input data: %w", err)
 		}
-		executeLogger.Printf("Input: %d bytes from resource '%s' (hash: %s)\n", n, inputResource.Name, inputResource.ObjectHash[:16]+"...")
+		executeLogger.Verbosef("Input: %d bytes from resource '%s' (hash: %s)\n", n, inputResource.Name, inputResource.ObjectHash[:16]+"...")
 	} else {
-		executeLogger.Printf("Input: (empty - start step)\n")
+		executeLogger.Verbosef("Input: (empty - start step)\n")
 	}
 
 	return nil
@@ -109,7 +115,7 @@ func (e *ScriptExecutor) runScript(cmd *exec.Cmd, step Step) error {
 		defer wg.Done()
 		scanner := bufio.NewScanner(stdoutPipe)
 		for scanner.Scan() {
-			scriptLogger.Printf("[stdout] %s\n", scanner.Text())
+			scriptLogger.Verbosef("[stdout] %s\n", scanner.Text())
 		}
 	}()
 
@@ -117,7 +123,7 @@ func (e *ScriptExecutor) runScript(cmd *exec.Cmd, step Step) error {
 		defer wg.Done()
 		scanner := bufio.NewScanner(stderrPipe)
 		for scanner.Scan() {
-			scriptLogger.Printf("[stderr] %s\n", scanner.Text())
+			scriptLogger.Verbosef("[stderr] %s\n", scanner.Text())
 		}
 	}()
 
@@ -132,10 +138,5 @@ func (e *ScriptExecutor) runScript(cmd *exec.Cmd, step Step) error {
 		return fmt.Errorf("script execution failed: %w", err)
 	}
 
-	return nil
-}
-
-func (e *ScriptExecutor) setupFUSEWatcher(cmd *exec.Cmd, step Step) error {
-	// TODO: Implement FUSE-based watcher if needed
 	return nil
 }

@@ -81,7 +81,7 @@ func NewTempDirFuseWatcher(outputChan chan<- FileData) (*FuseWatcher, error) {
 
 // Start begins serving the FUSE filesystem
 func (fw *FuseWatcher) Start() {
-	fuseLogger.Printf("Starting server at %s\n", fw.mountPath)
+	fuseLogger.Verbosef("Starting server at %s\n", fw.mountPath)
 	go fw.server.Serve()
 }
 
@@ -108,7 +108,7 @@ func (fw *FuseWatcher) Stop() error {
 	fw.closed = true
 	fw.mu.Unlock()
 
-	fuseLogger.Printf("Stopping server at %s\n", fw.mountPath)
+	fuseLogger.Verbosef("Stopping server at %s\n", fw.mountPath)
 
 	// Wait for any open files to be closed (with short timeout)
 	done := make(chan struct{})
@@ -119,24 +119,24 @@ func (fw *FuseWatcher) Stop() error {
 
 	select {
 	case <-done:
-		fuseLogger.Printf("All files closed gracefully\n")
+		fuseLogger.Verbosef("All files closed gracefully\n")
 	case <-time.After(2 * time.Second):
-		fuseLogger.Printf("Timeout waiting for open files, continuing shutdown\n")
+		fuseLogger.Verbosef("Timeout waiting for open files, continuing shutdown\n")
 	}
 
 	// Unmount the filesystem
 	err := fw.server.Unmount()
 	if err != nil {
-		fuseLogger.Printf("Error unmounting: %v\n", err)
+		fuseLogger.Verbosef("Error unmounting: %v\n", err)
 	}
 
 	// Clean up the mount directory
 	if err := os.RemoveAll(fw.mountPath); err != nil {
-		fuseLogger.Printf("Error removing mount directory %s: %v\n", fw.mountPath, err)
+		fuseLogger.Verbosef("Error removing mount directory %s: %v\n", fw.mountPath, err)
 		return err
 	}
 
-	fuseLogger.Printf("Cleaned up mount directory %s\n", fw.mountPath)
+	fuseLogger.Verbosef("Cleaned up mount directory %s\n", fw.mountPath)
 
 	return nil
 }
@@ -165,14 +165,14 @@ func (fs *fuseFS) GetAttr(name string, context *fuse.Context) (*fuse.Attr, fuse.
 		}, fuse.OK
 	}
 
-	fuseLogger.Printf("getattr %s\n", name)
+	fuseLogger.Verbosef("getattr %s\n", name)
 
 	return nil, fuse.ENOENT
 }
 
 func (fs *fuseFS) OpenDir(name string, context *fuse.Context) ([]fuse.DirEntry, fuse.Status) {
 	// Deny directory listing - write-only directory
-	fuseLogger.Printf("opendir refused %s\n", name)
+	fuseLogger.Verbosef("opendir refused %s\n", name)
 	return nil, fuse.EACCES
 }
 
@@ -187,7 +187,7 @@ func (fs *fuseFS) Open(name string, flags uint32, context *fuse.Context) (nodefs
 	// Check if opening for read - deny read access (write-only filesystem)
 	accessMode := flags & 0x3 // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
 	if accessMode == 0 {      // O_RDONLY
-		fuseLogger.Printf("open %s denied - read access not permitted\n", name)
+		fuseLogger.Verbosef("open %s denied - read access not permitted\n", name)
 		return nil, fuse.EACCES
 	}
 
@@ -197,7 +197,7 @@ func (fs *fuseFS) Open(name string, flags uint32, context *fuse.Context) (nodefs
 	fs.watcher.files[name] = fd
 	fs.watcher.openFiles.Add(1) // Track this open file
 
-	fuseLogger.Printf("open %s flags=0x%x (write)\n", name, flags)
+	fuseLogger.Verbosef("open %s flags=0x%x (write)\n", name, flags)
 
 	return &fuseFile{
 		File:    nodefs.NewDefaultFile(),
@@ -219,7 +219,7 @@ func (fs *fuseFS) Create(name string, flags uint32, mode uint32, context *fuse.C
 	fs.watcher.files[name] = fd
 	fs.watcher.openFiles.Add(1) // Track this open file
 
-	fuseLogger.Printf("create %s flags=%d mode=%d\n", name, flags, mode)
+	fuseLogger.Verbosef("create %s flags=%d mode=%d\n", name, flags, mode)
 
 	return &fuseFile{
 		File:    nodefs.NewDefaultFile(),
@@ -233,7 +233,7 @@ func (fs *fuseFS) Unlink(name string, context *fuse.Context) fuse.Status {
 	fs.watcher.mu.Lock()
 	defer fs.watcher.mu.Unlock()
 
-	fuseLogger.Printf("unlink %s\n", name)
+	fuseLogger.Verbosef("unlink %s\n", name)
 	delete(fs.watcher.files, name)
 	return fuse.OK
 }
@@ -260,7 +260,7 @@ func (f *fuseFile) Write(data []byte, off int64) (uint32, fuse.Status) {
 
 	// Only log first write to avoid spam for large files
 	if off == 0 {
-		fuseLogger.Printf("write %s started\n", f.name)
+		fuseLogger.Verbosef("write %s started\n", f.name)
 	}
 	copy(f.data.content[off:], data)
 	return uint32(len(data)), fuse.OK
@@ -330,7 +330,7 @@ func (f *fuseFile) Release() {
 		}
 	}
 
-	fuseLogger.Printf("release %s\n", f.name)
+	fuseLogger.Verbosef("release %s\n", f.name)
 
 	// DON'T delete from map - allow file to be opened/written again
 	// Each Create() will replace the entry with fresh data

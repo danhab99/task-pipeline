@@ -66,7 +66,7 @@ func (p *Pipeline) ExecuteStep(step Step, maxParallel int) int64 {
 		pr = &x
 	}
 	workers.Parallel0(taskChan, *pr, func(task Task) {
-		pipelineLogger.Printf("Executing task %d for step %s\n", task.ID, step.Name)
+		pipelineLogger.Verbosef("Executing task %d for step %s\n", task.ID, step.Name)
 
 		execErr := executor.Execute(task, step, p.outputChan)
 

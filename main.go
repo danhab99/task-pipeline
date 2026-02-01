@@ -68,5 +68,8 @@ func main() {
 		exportResourcesByName(database, *exportName)
 	} else if exportHash != nil && *exportHash != "" {
 		exportResourceByHash(database, *exportHash)
+	} else {
+		fmt.Println("-run or -export is required")
+		flag.Usage()
 	}
 }
