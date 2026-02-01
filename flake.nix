@@ -19,7 +19,7 @@
         packages = {
           default = pkgs.buildGoModule {
             pname = "grit";
-            version = "0.2.1";
+            version = "0.2.2";
             src = self;
             vendorHash = "sha256-NEWUHUio0oPZdSB9obpZEOD5RQcIsAwnosQg2yESXME=";
             subPackages = [ "." ];
