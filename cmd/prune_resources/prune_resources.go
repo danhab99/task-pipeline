@@ -4,6 +4,7 @@ package prune_resources
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
 
 	"grit/db"
@@ -29,12 +30,14 @@ func Execute() {
 		os.Exit(1)
 	}
 
+	log.Println("Opening database")
 	database, err := db.NewDatabase(*dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error opening database: %v\n", err)
 		os.Exit(1)
 	}
 	defer database.Close()
+	log.Println("Opened database")
 
 	names := make([]string, 0)
 	if *name != "" {
@@ -66,6 +69,8 @@ func Execute() {
 				idx++
 				continue
 			}
+
+			log.Printf("Deleting resources %s:%s\n", resourceName, r.ObjectHash)
 
 			result, err := database.DeleteResourceHard(r.ID)
 			if err != nil {
