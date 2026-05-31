@@ -1,14 +1,18 @@
 package types
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 type Step struct {
-	ID       string `msgpack:"id"`
-	Name     string `msgpack:"name"`
-	Script   string `msgpack:"script"`
-	Parallel *int   `msgpack:"parallel,omitempty"`
-	Input    string `msgpack:"input,omitempty"`
-	Version  int    `msgpack:"version"`
+	ID       string         `msgpack:"id"`
+	Name     string         `msgpack:"name"`
+	Script   string         `msgpack:"script"`
+	Parallel *int           `msgpack:"parallel,omitempty"`
+	Input    string         `msgpack:"input,omitempty"`
+	Timeout  *time.Duration `msgpack:"timeout,omitempty"`
+	Version  int            `msgpack:"version"`
 }
 
 type Task struct {

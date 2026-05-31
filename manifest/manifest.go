@@ -5,6 +5,7 @@ import (
 	"grit/db"
 	"grit/types"
 	"slices"
+	"time"
 )
 
 type Manifest struct {
@@ -19,10 +20,11 @@ type ManifestCsvFile struct {
 }
 
 type ManifestStep struct {
-	Name     string `toml:"name"`
-	Script   string `toml:"script"`
-	Parallel *int   `toml:"parallel"`
-	Input    string `toml:"input"`
+	Name     string         `toml:"name"`
+	Script   string         `toml:"script"`
+	Parallel *int           `toml:"parallel"`
+	Input    string         `toml:"input"`
+	Timeout  *time.Duration `toml:"timeout"`
 }
 
 func (manifest Manifest) RegisterSteps(database *db.Database, enabledSteps []string) []types.Step {
@@ -34,6 +36,7 @@ func (manifest Manifest) RegisterSteps(database *db.Database, enabledSteps []str
 			Script:   manifestStep.Script,
 			Parallel: manifestStep.Parallel,
 			Input:    manifestStep.Input,
+			Timeout:  manifestStep.Timeout,
 		}
 
 		id, err := database.CreateStep(step)

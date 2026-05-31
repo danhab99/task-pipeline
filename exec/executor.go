@@ -2,12 +2,15 @@ package exec
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
 	"grit/db"
 	"grit/log"
 	"grit/types"
 	"os"
 	"os/exec"
+	"syscall"
 	"sync"
 	"time"
 )
@@ -21,6 +24,9 @@ func NewScriptExecutor(db *db.Database) *ScriptExecutor {
 }
 
 var executeLogger = log.NewLogger("EXEC")
+
+// ErrTimeout is returned when a script exceeds its configured timeout.
+var ErrTimeout = errors.New("script timed out")
 
 // func (e *ScriptExecutor) ExecuteStep(step types.Step, defaultParallel int) error {
 // 	database := e.db
@@ -71,8 +77,23 @@ func (e *ScriptExecutor) Execute(task types.Task, step types.Step) error {
 	cmd := e.buildCommand(step, inputFile.Name(), outputDir, task.ID)
 
 	// Run script and capture output
-	if err := e.runScript(cmd, step); err != nil {
-		return err
+	var runErr error
+	if step.Timeout != nil && *step.Timeout > 0 {
+		runErr = e.runScriptWithTimeout(cmd, step, *step.Timeout)
+	} else {
+		runErr = e.runScript(cmd, step)
+	}
+
+	elapsedTime := time.Since(start)
+
+	// If the script timed out, mark the task as complete with no outputs.
+	if errors.Is(runErr, ErrTimeout) {
+		executeLogger.Printf("Task ID=%s for step '%s' timed out after %s, killed with SIGKILL\n", task.ID, step.Name, elapsedTime.String())
+		return ErrTimeout
+	}
+
+	if runErr != nil {
+		return runErr
 	}
 
 	// Ingest output files synchronously
@@ -89,8 +110,6 @@ func (e *ScriptExecutor) Execute(task types.Task, step types.Step) error {
 			return fmt.Errorf("failed to ingest output file %s: %w", entry.Name(), err)
 		}
 	}
-
-	elapsedTime := time.Since(start)
 
 	executeLogger.Printf("Executed task ID=%s for step '%s' successfully in %s\n", task.ID, step.Name, elapsedTime.String())
 	return nil
@@ -179,6 +198,72 @@ func (e *ScriptExecutor) runScript(cmd *exec.Cmd, step types.Step) error {
 	}
 
 	return nil
+}
+
+func (e *ScriptExecutor) runScriptWithTimeout(cmd *exec.Cmd, step types.Step, timeout time.Duration) error {
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stdout pipe: %w", err)
+	}
+
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stderr pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		executeLogger.Printf("Error starting script: %v\n", err)
+		return fmt.Errorf("failed to start script: %w", err)
+	}
+
+	scriptLogger := executeLogger.Context(step.Name)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(stdoutPipe)
+		for scanner.Scan() {
+			scriptLogger.Verbosef("[stdout] %s\n", scanner.Text())
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(stderrPipe)
+		for scanner.Scan() {
+			scriptLogger.Verbosef("[stderr] %s\n", scanner.Text())
+		}
+	}()
+
+	// Wait for command to finish with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+
+	select {
+	case err := <-done:
+		wg.Wait()
+		if err != nil {
+			executeLogger.Printf("Error executing script: %v\n", err)
+			return fmt.Errorf("script execution failed: %w", err)
+		}
+		return nil
+	case <-ctx.Done():
+		executeLogger.Printf("Script '%s' exceeded timeout of %s, sending SIGKILL\n", step.Name, timeout)
+		// Send SIGKILL to the process group
+		if cmd.Process != nil {
+			cmd.Process.Signal(syscall.SIGKILL)
+			cmd.Process.Wait()
+		}
+		wg.Wait()
+		return ErrTimeout
+	}
 }
 
 

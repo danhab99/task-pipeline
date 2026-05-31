@@ -236,6 +236,10 @@ func (d Database) CountStepsWithoutParallel() (int64, error) {
 }
 
 func (d Database) DeleteStep(id string) error {
+	for task := range d.GetTasksForStep(id) {
+		d.DeleteTask(task.ID)
+	}
+
 	return d.badgerDB.Update(func(txn *badger.Txn) error {
 		step, err := getEntity[Step](txn, stepKey(id))
 		if err != nil {
@@ -256,6 +260,33 @@ func (d Database) DeleteStep(id string) error {
 func (d Database) UpdateStepStatus(id string, processed bool) error {
 	// No-op: step processed status is no longer tracked
 	return nil
+}
+
+func (d Database) GetStepVersions(name string) chan Step {
+	ch := make(chan Step)
+	go func() {
+		defer close(ch)
+		prefix := idxStepByNamePrefix(name)
+		err := d.badgerDB.View(func(txn *badger.Txn) error {
+			return prefixScan(txn, prefix, func(key, val []byte) (bool, error) {
+				parts := strings.Split(string(key[len(prefix):]), "\x00")
+				if len(parts) < 2 {
+					return true, nil
+				}
+				stepULID := parts[len(parts)-1]
+				s, err := getEntity[Step](txn, stepKey(stepULID))
+				if err != nil || s == nil {
+					return true, nil
+				}
+				ch <- *s
+				return true, nil
+			})
+		})
+		if err != nil {
+			fmt.Printf("Error in GetStepVersions: %v\n", err)
+		}
+	}()
+	return ch
 }
 
 func (d Database) GetTaintedSteps() chan Step {

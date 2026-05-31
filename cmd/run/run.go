@@ -244,7 +244,7 @@ func constructRunnerPipeline(m manifest.Manifest, database db.Database, enabledS
 	}
 
 	stop := func() {
-		database.Close()
+		// database.Close() is handled by the caller's defer
 	}
 
 	go func() {

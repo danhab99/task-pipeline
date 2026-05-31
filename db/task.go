@@ -32,12 +32,12 @@ func (d Database) CreateTask(task Task) (string, error) {
 			return err
 		}
 
-// Unique constraint index
-			if task.InputResourceID != nil {
-				if err := txn.Set(idxTaskUniqueKey(task.StepID, *task.InputResourceID), []byte(id)); err != nil {
-				return err
-			}
-		}
+ // Unique constraint index
+ 		if task.InputResourceID != nil {
+ 			if err := txn.Set(idxTaskUniqueKey(task.StepID, *task.InputResourceID), []byte(id)); err != nil {
+ 				return err
+ 			}
+ 		}
 
 		resultID = id
 		return nil
