@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"grit/log"
 	"os"
+	"runtime"
 	"time"
 
 	badger "github.com/dgraph-io/badger/v4"
@@ -55,6 +56,9 @@ func NewDatabase(repo_path string) (Database, error) {
 		return Database{}, fmt.Errorf("failed to open BadgerDB: %w", err)
 	}
 
+	dbLogger.Println("Flattening database")
+	badgerDB.Flatten(max(2, runtime.NumCPU()-2))
+
 	dbLogger.Println("Database ready")
 	return Database{repo_path, badgerDB}, nil
 }
@@ -97,4 +101,3 @@ func (d Database) StartValueLogGC(interval time.Duration, stop <-chan struct{}) 
 		}
 	}()
 }
-
