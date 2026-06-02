@@ -2,11 +2,10 @@ package db
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"os"
-
-	badger "github.com/dgraph-io/badger/v4"
 )
 
 // IngestFile reads a file from disk, hashes it, routes blob storage by size,
@@ -30,35 +29,28 @@ func (d *Database) IngestFile(path, name, taskID string) error {
 }
 
 func (d *Database) insertResource(name, hash, taskID, backend string) error {
-	return d.badgerDB.Update(func(txn *badger.Txn) error {
-		hashIdxKey := idxResourceHashKey(name, hash)
-		existing, err := getVal(txn, hashIdxKey)
-		if err != nil {
-			return err
-		}
-		if existing != nil {
-			return nil // already exists, idempotent
-		}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 
-		id := newULID()
-		res := Resource{
-			ID:              id,
-			Name:            name,
-			ObjectHash:      hash,
-			CreatedAt:       nowTimestamp(),
-			CreatedByTaskID: &taskID,
-			StorageBackend:  backend,
-		}
+	var existingID string
+	err = tx.QueryRow(`SELECT id FROM resources WHERE name = ? AND object_hash = ?`, name, hash).Scan(&existingID)
+	if err == nil {
+		return tx.Commit()
+	}
+	if err != nil && err != sql.ErrNoRows {
+		return err
+	}
 
-		if err := putEntity(txn, resourceKey(id), &res); err != nil {
-			return err
-		}
-		if err := txn.Set(idxResourceByNameKey(name, id), nil); err != nil {
-			return err
-		}
-		if err := txn.Set(hashIdxKey, []byte(id)); err != nil {
-			return err
-		}
-		return nil
-	})
+	resourceID := newULID()
+	createdByTaskID := any(nil)
+	if taskID != "" {
+		createdByTaskID = taskID
+	}
+	if _, err := tx.Exec(`INSERT INTO resources(id, name, object_hash, created_at, created_by_task_id, storage_backend) VALUES(?, ?, ?, ?, ?, ?)`, resourceID, name, hash, nowTimestamp(), createdByTaskID, backend); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

@@ -11,65 +11,42 @@ import (
 	"os"
 	"strconv"
 	"strings"
-
-	badger "github.com/dgraph-io/badger/v4"
 )
 
 // getCsvFileHash retrieves the stored hash for a CSV file path, or "" if none.
 func (d *Database) getCsvFileHash(path string) (string, error) {
-	var hash string
-	err := d.badgerDB.View(func(txn *badger.Txn) error {
-		val, err := getVal(txn, metaCsvHashKey(path))
-		if err != nil {
-			return err
-		}
-		if val != nil {
-			hash = string(val)
-		}
-		return nil
-	})
-	return hash, err
+	return getMetaValue(d.db, string(metaCsvHashKey(path)))
 }
 
 // setCsvFileHash stores the hash for a CSV file path.
 func (d *Database) setCsvFileHash(path, hash string) error {
-	return d.badgerDB.Update(func(txn *badger.Txn) error {
-		return txn.Set(metaCsvHashKey(path), []byte(hash))
-	})
+	return setMetaValue(d.db, string(metaCsvHashKey(path)), hash)
 }
 
 // getCsvFileOffset returns the byte offset of the last committed batch for path, or 0.
 func (d *Database) getCsvFileOffset(path string) (int64, error) {
-	var offset int64
-	err := d.badgerDB.View(func(txn *badger.Txn) error {
-		val, err := getVal(txn, metaCsvOffsetKey(path))
-		if err != nil {
-			return err
-		}
-		if val != nil {
-			n, err := strconv.ParseInt(string(val), 10, 64)
-			if err != nil {
-				return fmt.Errorf("invalid CSV offset value: %w", err)
-			}
-			offset = n
-		}
-		return nil
-	})
-	return offset, err
+	val, err := getMetaValue(d.db, string(metaCsvOffsetKey(path)))
+	if err != nil {
+		return 0, err
+	}
+	if val == "" {
+		return 0, nil
+	}
+	offset, err := strconv.ParseInt(val, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid CSV offset value: %w", err)
+	}
+	return offset, nil
 }
 
 // setCsvFileOffset persists the committed byte offset for crash recovery.
 func (d *Database) setCsvFileOffset(path string, offset int64) error {
-	return d.badgerDB.Update(func(txn *badger.Txn) error {
-		return txn.Set(metaCsvOffsetKey(path), []byte(strconv.FormatInt(offset, 10)))
-	})
+	return setMetaValue(d.db, string(metaCsvOffsetKey(path)), strconv.FormatInt(offset, 10))
 }
 
 // deleteCsvFileOffset removes the in-progress offset once ingestion completes.
 func (d *Database) deleteCsvFileOffset(path string) error {
-	return d.badgerDB.Update(func(txn *badger.Txn) error {
-		return txn.Delete(metaCsvOffsetKey(path))
-	})
+	return deleteMetaValue(d.db, string(metaCsvOffsetKey(path)))
 }
 
 // hashFile streams through a file computing its SHA-256 without loading it all into memory.

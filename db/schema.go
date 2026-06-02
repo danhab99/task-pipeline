@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"grit/types"
 
 	badger "github.com/dgraph-io/badger/v4"
@@ -8,6 +9,7 @@ import (
 
 type Database struct {
 	repo_path string
+	db        *sql.DB
 	badgerDB  *badger.DB
 }
 
