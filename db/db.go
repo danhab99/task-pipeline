@@ -79,6 +79,31 @@ func (d Database) ForceSaveWAL() error {
 	return err
 }
 
+// PrepareForReads optimizes the database for upcoming read-heavy workloads.
+// Call this after write phases complete, before transitioning to bulk reads.
+// Runs: aggressive checkpoint (RESTART), statistics update (ANALYZE), and index reoptimization (OPTIMIZE).
+func (d Database) PrepareForReads() error {
+	if d.db == nil {
+		return nil
+	}
+
+	// RESTART checkpoint: syncs all writes and prevents WAL from growing during reads.
+	// More aggressive than TRUNCATE; reduces random I/O during query execution.
+	if _, err := d.db.Exec(`PRAGMA wal_checkpoint(RESTART)`); err != nil {
+		dbLogger.Verbosef("Warning: wal_checkpoint(RESTART) failed: %v\n", err)
+	}
+
+	// ANALYZE: scans tables to update statistics. Query planner uses these to pick better index strategies.
+	if _, err := d.db.Exec(`PRAGMA analysis_limit=400`); err != nil {
+		dbLogger.Verbosef("Warning: analysis_limit pragma failed: %v\n", err)
+	}
+	if _, err := d.db.Exec(`PRAGMA optimize`); err != nil {
+		dbLogger.Verbosef("Warning: PRAGMA optimize failed: %v\n", err)
+	}
+
+	return nil
+}
+
 // StartValueLogGC now periodically checkpoints SQLite WAL during long-running
 // pipeline execution. The name stays for API compatibility.
 func (d Database) StartValueLogGC(interval time.Duration, stop <-chan struct{}) {
