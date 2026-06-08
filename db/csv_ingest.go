@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // getCsvFileHash retrieves the stored hash for a CSV file path, or "" if none.
@@ -130,15 +131,34 @@ func (d *Database) IngestCsvFile(path string, outputName string, columns []strin
 		if len(objectBatch) == 0 {
 			return nil
 		}
+		
+		// Parallel file writes: WaitGroup-based concurrency
+		var wg sync.WaitGroup
+		errChan := make(chan error, len(objectBatch))
+		
 		for _, item := range objectBatch {
-			if err := d.StoreObject(item.hash, item.data); err != nil {
-				return fmt.Errorf("failed to store object: %w", err)
-			}
-			backend := d.StorageBackendForSize(len(item.data))
-			if err := d.insertResource(outputName, item.hash, "", backend); err != nil {
-				return fmt.Errorf("failed to create resource: %w", err)
-			}
+			wg.Add(1)
+			go func(hash string, data []byte) {
+				defer wg.Done()
+				if err := d.StoreObject(hash, data); err != nil {
+					errChan <- fmt.Errorf("failed to store object %s: %w", hash, err)
+				}
+			}(item.hash, item.data)
 		}
+		
+		wg.Wait()
+		close(errChan)
+		
+		// Check for any errors from parallel writes
+		for err := range errChan {
+			return err
+		}
+		
+		// Batch insert resources in a single transaction
+		if err := d.batchInsertResources(outputName, objectBatch); err != nil {
+			return fmt.Errorf("failed to batch insert resources: %w", err)
+		}
+		
 		if err := d.setCsvFileOffset(path, bytePos); err != nil {
 			return fmt.Errorf("failed to save CSV offset: %w", err)
 		}

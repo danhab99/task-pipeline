@@ -226,15 +226,17 @@ func (d Database) CountUnprocessedTasksForStep(stepID string) (int64, error) {
 }
 
 func (d Database) GetTaskCountsForStep(stepID string) (total int64, processed int64, err error) {
-	total, err = d.CountTasksForStep(stepID)
+	// Single query: count all tasks and unprocessed tasks in one pass
+	var unprocessed int64
+	err = d.db.QueryRow(`
+		SELECT COUNT(*) as total, COUNT(CASE WHEN processed=0 THEN 1 END) as unprocessed
+		FROM tasks
+		WHERE step_id = ?`, stepID).Scan(&total, &unprocessed)
 	if err != nil {
 		return 0, 0, err
 	}
-	unprocessed, err := d.CountUnprocessedTasksForStep(stepID)
-	if err != nil {
-		return total, 0, err
-	}
-	return total, total - unprocessed, nil
+	processed = total - unprocessed
+	return total, processed, nil
 }
 
 func (d Database) DeleteTask(id string) error {

@@ -54,3 +54,38 @@ func (d *Database) insertResource(name, hash, taskID, backend string) error {
 	}
 	return tx.Commit()
 }
+
+// batchInsertResources inserts multiple resources in a single transaction with deduplication.
+// Takes a slice of {hash, data} structs and inserts them all as resources under the given name.
+func (d *Database) batchInsertResources(name string, items []struct {
+	hash string
+	data []byte
+}) error {
+	if len(items) == 0 {
+		return nil
+	}
+
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Prepare statement for efficient bulk insert with conflict handling
+	stmt, err := tx.Prepare(`INSERT OR IGNORE INTO resources(id, name, object_hash, created_at, created_by_task_id, storage_backend) VALUES(?, ?, ?, ?, NULL, ?)`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	now := nowTimestamp()
+	for _, item := range items {
+		backend := d.StorageBackendForSize(len(item.data))
+		resourceID := newULID()
+		if _, err := stmt.Exec(resourceID, name, item.hash, now, backend); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}

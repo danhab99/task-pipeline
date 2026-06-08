@@ -93,8 +93,8 @@ func (d Database) GetResourcesByName(name string) chan Resource {
 			rows, err := d.db.Query(`
 				SELECT id, name, object_hash, created_at, created_by_task_id, storage_backend
 				FROM resources
-				WHERE name = ? AND (? = '' OR id < ?)
-				ORDER BY id DESC
+			WHERE name = ? AND (? = '' OR id > ?)
+			ORDER BY id ASC
 				LIMIT ?`, name, lastID, lastID, scanBatchSize)
 			if err != nil {
 				dbLogger.Verbosef("Error querying resources by name %s: %v\n", name, err)
@@ -211,11 +211,11 @@ func (d Database) GetUnconsumedResourcesByName(name string, consumingStepID stri
 				SELECT r.id, r.name, r.object_hash, r.created_at, r.created_by_task_id, r.storage_backend
 				FROM resources r
 				WHERE r.name = ?
-				  AND (? = '' OR r.id < ?)
-				  AND NOT EXISTS (
-					SELECT 1 FROM tasks t WHERE t.step_id = ? AND t.input_resource_id = r.id
-				  )
-				ORDER BY r.id DESC
+			  AND (? = '' OR r.id > ?)
+			  AND NOT EXISTS (
+				SELECT 1 FROM tasks t WHERE t.step_id = ? AND t.input_resource_id = r.id
+			  )
+			ORDER BY r.id ASC
 				LIMIT ?`, name, lastID, lastID, consumingStepID, scanBatchSize)
 			if err != nil {
 				dbLogger.Verbosef("Error querying unconsumed resources for name %s, step %s: %v\n", name, consumingStepID, err)

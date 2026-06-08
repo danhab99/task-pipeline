@@ -178,10 +178,9 @@ func (d Database) CountStepsWithoutParallel() (int64, error) {
 }
 
 func (d Database) DeleteStep(id string) error {
-	for task := range d.GetTasksForStep(id) {
-		if err := d.DeleteTask(task.ID); err != nil {
-			return err
-		}
+	// Bulk delete all tasks for this step in a single query instead of N+1
+	if _, err := d.db.Exec(`DELETE FROM tasks WHERE step_id = ?`, id); err != nil {
+		return err
 	}
 	_, err := d.db.Exec(`DELETE FROM steps WHERE id = ?`, id)
 	return err
