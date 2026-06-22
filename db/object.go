@@ -6,25 +6,44 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	badger "github.com/dgraph-io/badger/v4"
 )
 
-// Objects now always live on the filesystem. Keep the legacy sentinel so Badger
-// migration can detect file-backed values from older databases.
+// fsObjectThreshold is the size above which blobs are stored on the filesystem
+// rather than inline in BadgerDB. 64 KiB keeps small values (domain names,
+// short text) in the LSM tree while shunting large blobs (HTML, images) to disk.
+const fsObjectThreshold = 64 * 1024
+
+// fsSentinel is stored as the BadgerDB value for objects routed to the filesystem.
 const fsSentinel = "fs"
 
 func (d Database) objectFilePath(hash string) string {
-	return filepath.Join(d.repo_path, "objects", hash[0:3], hash[3:6], hash[6:9], hash[9:])
+	return filepath.Join(d.repoPath, "objects", hash[0:3], hash[3:6], hash[6:9], hash[9:])
 }
 
 func (d Database) StoreObject(hash string, data []byte) error {
-	return d.storeObjectFS(hash, data)
+	if len(data) >= fsObjectThreshold {
+		return d.storeObjectFS(hash, data)
+	}
+	return d.storeObjectBadger(hash, data)
+}
+
+func (d Database) storeObjectBadger(hash string, data []byte) error {
+	hashBytes, err := hex.DecodeString(hash)
+	if err != nil {
+		return err
+	}
+	wb := d.resourcePoolDB.NewWriteBatch()
+	defer wb.Cancel()
+	if err := wb.Set(objectKey(hashBytes), data); err != nil {
+		return err
+	}
+	return wb.Flush()
 }
 
 func (d Database) storeObjectFS(hash string, data []byte) error {
 	path := d.objectFilePath(hash)
-	if _, err := os.Stat(path); err == nil {
-		return nil
-	}
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return fmt.Errorf("failed to create object dir: %w", err)
 	}
@@ -36,11 +55,24 @@ func (d Database) storeObjectFS(hash string, data []byte) error {
 	if err := os.Rename(tmp, path); err != nil {
 		return fmt.Errorf("failed to rename object file: %w", err)
 	}
-	return nil
+	// Record sentinel in BadgerDB so we know where to fetch from.
+	hashBytes, err := hex.DecodeString(hash)
+	if err != nil {
+		return err
+	}
+	wb := d.resourcePoolDB.NewWriteBatch()
+	defer wb.Cancel()
+	if err := wb.Set(objectKey(hashBytes), []byte(fsSentinel)); err != nil {
+		return err
+	}
+	return wb.Flush()
 }
 
 func (d Database) StorageBackendForSize(size int) string {
-	return typesStorageBackendFS()
+	if size >= fsObjectThreshold {
+		return "fs"
+	}
+	return "inline"
 }
 
 func (d Database) StoreObjectAndGetHash(data []byte) (string, error) {
@@ -53,11 +85,37 @@ func (d Database) StoreObjectAndGetHash(data []byte) (string, error) {
 }
 
 func (d Database) GetObject(hash string) ([]byte, error) {
-	return os.ReadFile(d.objectFilePath(hash))
+	hashBytes, err := hex.DecodeString(hash)
+	if err != nil {
+		return nil, err
+	}
+	var val []byte
+	err = d.resourcePoolDB.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(objectKey(hashBytes))
+		if err != nil {
+			return err
+		}
+		val, err = item.ValueCopy(nil)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	if string(val) == fsSentinel {
+		return os.ReadFile(d.objectFilePath(hash))
+	}
+	return val, nil
 }
 
 func (d Database) ObjectExists(hash string) bool {
-	_, err := os.Stat(d.objectFilePath(hash))
+	hashBytes, err := hex.DecodeString(hash)
+	if err != nil {
+		return false
+	}
+	err = d.resourcePoolDB.View(func(txn *badger.Txn) error {
+		_, err := txn.Get(objectKey(hashBytes))
+		return err
+	})
 	return err == nil
 }
 

@@ -81,16 +81,6 @@ func (p *Pipeline) ExecuteStep(step types.Step, maxParallel int) int64 {
 		pipelineLogger.Printf("Step %s: scheduled %d new tasks\n", step.Name, tasksCreated)
 	}
 
-	err = database.ForceSaveWAL()
-	if err != nil {
-		panic(err)
-	}
-
-	// Optimize database for read-heavy task execution phase
-	if err := database.PrepareForReads(); err != nil {
-		pipelineLogger.Printf("Warning: failed to optimize database for reads: %v\n", err)
-	}
-
 	taskChan := database.GetUnprocessedTasks(step.ID)
 
 	var executionCount atomic.Int64

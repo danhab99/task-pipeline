@@ -122,7 +122,7 @@ func listSteps() {
 			if s.Parallel != nil {
 				parallel = fmt.Sprintf("%d", *s.Parallel)
 			}
-			fmt.Printf("  %-*s  v%-4s  parallel=%s  id=%s\n", maxNameLen, name, s.Version, parallel, s.ID)
+			fmt.Printf("  %-*s  v%-4d  parallel=%s  id=%s\n", maxNameLen, name, s.Version, parallel, s.ID)
 		}
 	}
 }
@@ -157,7 +157,7 @@ func listVersions(name string) {
 		if v.Parallel != nil {
 			parallel = fmt.Sprintf("%d", *v.Parallel)
 		}
-		fmt.Printf("  v%-4s  parallel=%s  id=%s\n", v.Version, parallel, v.ID)
+		fmt.Printf("  v%-4d  parallel=%s  id=%s\n", v.Version, parallel, v.ID)
 	}
 }
 

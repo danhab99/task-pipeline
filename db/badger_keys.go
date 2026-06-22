@@ -52,6 +52,15 @@ const (
 	// Key: ix:rh:{name}\x00{object_hash}  →  resource_ulid
 	idxResourceHash = "ix:rh:"
 
+	// idxResourceRoute is the typed resource router used by step polling.
+	// Key: ix:rr:{resource_type}\x00{status}\x00{resource_ulid}
+	idxResourceRoute = "ix:rr:"
+
+)
+
+const (
+	ResourceStatusUnprocessed = "unprocessed"
+	ResourceStatusProcessing  = "processing"
 )
 
 // --- Primary key builders ---
@@ -91,6 +100,10 @@ func idxResourceHashKey(name, objectHash string) []byte {
 	return []byte(idxResourceHash + name + "\x00" + objectHash)
 }
 
+func idxResourceRouteKey(resourceType, status, id string) []byte {
+	return []byte(idxResourceRoute + resourceType + "\x00" + status + "\x00" + id)
+}
+
 // --- Prefix builders for scans ---
 
 func idxStepByNamePrefix(name string) []byte {
@@ -107,6 +120,10 @@ func idxTaskByStepAllPrefix(stepID string) []byte {
 
 func idxResourceByNamePrefix(name string) []byte {
 	return []byte(idxResourceByName + name + "\x00")
+}
+
+func idxResourceRoutePrefix(resourceType, status string) []byte {
+	return []byte(idxResourceRoute + resourceType + "\x00" + status + "\x00")
 }
 
 // --- Meta key builders ---

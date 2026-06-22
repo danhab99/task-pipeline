@@ -2,10 +2,11 @@ package db
 
 import (
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"os"
+
+	badger "github.com/dgraph-io/badger/v4"
 )
 
 // IngestFile reads a file from disk, hashes it, routes blob storage by size,
@@ -29,63 +30,44 @@ func (d *Database) IngestFile(path, name, taskID string) error {
 }
 
 func (d *Database) insertResource(name, hash, taskID, backend string) error {
-	tx, err := d.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	var existingID string
-	err = tx.QueryRow(`SELECT id FROM resources WHERE name = ? AND object_hash = ?`, name, hash).Scan(&existingID)
-	if err == nil {
-		return tx.Commit()
-	}
-	if err != nil && err != sql.ErrNoRows {
-		return err
-	}
-
-	resourceID := newULID()
-	createdByTaskID := any(nil)
-	if taskID != "" {
-		createdByTaskID = taskID
-	}
-	if _, err := tx.Exec(`INSERT INTO resources(id, name, object_hash, created_at, created_by_task_id, storage_backend) VALUES(?, ?, ?, ?, ?, ?)`, resourceID, name, hash, nowTimestamp(), createdByTaskID, backend); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-// batchInsertResources inserts multiple resources in a single transaction with deduplication.
-// Takes a slice of {hash, data} structs and inserts them all as resources under the given name.
-func (d *Database) batchInsertResources(name string, items []struct {
-	hash string
-	data []byte
-}) error {
-	if len(items) == 0 {
-		return nil
-	}
-
-	tx, err := d.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	// Prepare statement for efficient bulk insert with conflict handling
-	stmt, err := tx.Prepare(`INSERT OR IGNORE INTO resources(id, name, object_hash, created_at, created_by_task_id, storage_backend) VALUES(?, ?, ?, ?, NULL, ?)`)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-
-	now := nowTimestamp()
-	for _, item := range items {
-		backend := d.StorageBackendForSize(len(item.data))
-		resourceID := newULID()
-		if _, err := stmt.Exec(resourceID, name, item.hash, now, backend); err != nil {
+	var createdID string
+	err := d.resourcePoolDB.Update(func(txn *badger.Txn) error {
+		hashIdxKey := idxResourceHashKey(name, hash)
+		existing, err := getVal(txn, hashIdxKey)
+		if err != nil {
 			return err
 		}
+		if existing != nil {
+			return nil // already exists, idempotent
+		}
+
+		id := newULID()
+		res := Resource{
+			ID:              id,
+			Name:            name,
+			ObjectHash:      hash,
+			CreatedAt:       nowTimestamp(),
+			CreatedByTaskID: &taskID,
+			StorageBackend:  backend,
+		}
+
+		if err := putEntity(txn, resourceKey(id), &res); err != nil {
+			return err
+		}
+		if err := txn.Set(idxResourceByNameKey(name, id), nil); err != nil {
+			return err
+		}
+		if err := txn.Set(hashIdxKey, []byte(id)); err != nil {
+			return err
+		}
+		createdID = id
+		return nil
+	})
+	if err != nil || createdID == "" {
+		return err
 	}
 
-	return tx.Commit()
+	return d.stepEngineDB.Update(func(txn *badger.Txn) error {
+		return txn.Set(idxResourceRouteKey(name, ResourceStatusUnprocessed, createdID), nil)
+	})
 }

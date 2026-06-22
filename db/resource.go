@@ -2,10 +2,11 @@ package db
 
 import (
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"io"
+
+	badger "github.com/dgraph-io/badger/v4"
 )
 
 type ResourceDeleteResult struct {
@@ -22,32 +23,51 @@ func (d Database) CreateResource(name string, objectHash string) (string, error)
 }
 
 func (d Database) CreateResourceWithTask(name string, objectHash string, createdByTaskID *string) (string, error) {
-	tx, err := d.db.Begin()
-	if err != nil {
-		return "", err
-	}
-	defer tx.Rollback()
-
-	var resourceID string
-	err = tx.QueryRow(`SELECT id FROM resources WHERE name = ? AND object_hash = ?`, name, objectHash).Scan(&resourceID)
-	if err == nil {
-		if commitErr := tx.Commit(); commitErr != nil {
-			return "", commitErr
+	var resultID string
+	err := d.resourcePoolDB.Update(func(txn *badger.Txn) error {
+		// Check unique constraint: (name, object_hash)
+		hashKey := idxResourceHashKey(name, objectHash)
+		existing, err := getVal(txn, hashKey)
+		if err != nil {
+			return err
 		}
-		return resourceID, nil
-	}
-	if err != nil && err != sql.ErrNoRows {
-		return "", err
+		if existing != nil {
+			resultID = string(existing)
+			return nil // already exists
+		}
+
+		id := newULID()
+		res := Resource{
+			ID:              id,
+			Name:            name,
+			ObjectHash:      objectHash,
+			CreatedAt:       nowTimestamp(),
+			CreatedByTaskID: createdByTaskID,
+		}
+
+		if err := putEntity(txn, resourceKey(id), &res); err != nil {
+			return err
+		}
+
+		// Indexes
+		if err := txn.Set(idxResourceByNameKey(name, id), nil); err != nil {
+			return err
+		}
+		if err := txn.Set(hashKey, []byte(id)); err != nil {
+			return err
+		}
+
+		resultID = id
+		return nil
+	})
+	if err != nil || resultID == "" {
+		return resultID, err
 	}
 
-	resourceID = newULID()
-	if _, err := tx.Exec(`INSERT INTO resources(id, name, object_hash, created_at, created_by_task_id, storage_backend) VALUES(?, ?, ?, ?, ?, ?)`, resourceID, name, objectHash, nowTimestamp(), nullableStringValue(createdByTaskID), typesStorageBackendFS()); err != nil {
-		return "", err
-	}
-	if err := tx.Commit(); err != nil {
-		return "", err
-	}
-	return resourceID, nil
+	err = d.stepEngineDB.Update(func(txn *badger.Txn) error {
+		return txn.Set(idxResourceRouteKey(name, ResourceStatusUnprocessed, resultID), nil)
+	})
+	return resultID, err
 }
 
 func (d Database) CreateResourceFromReader(name string, reader io.Reader) (string, string, error) {
@@ -76,48 +96,72 @@ func (d Database) CreateResourceFromReader(name string, reader io.Reader) (strin
 }
 
 func (d Database) GetResource(id string) (*Resource, error) {
-	row := d.db.QueryRow(`SELECT id, name, object_hash, created_at, created_by_task_id, storage_backend FROM resources WHERE id = ?`, id)
-	resource, err := resourceFromScanner(row)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	return resource, err
+	var res *Resource
+	err := d.resourcePoolDB.View(func(txn *badger.Txn) error {
+		var err error
+		res, err = getEntity[Resource](txn, resourceKey(id))
+		return err
+	})
+	return res, err
 }
 
 func (d Database) GetResourcesByName(name string) chan Resource {
 	ch := make(chan Resource)
 	go func() {
 		defer close(ch)
-		lastID := ""
+		prefix := idxResourceByNamePrefix(name)
+		// Reverse scan: ULIDs are time-sorted, reverse gives newest first.
+		// cursor starts at the top of the range; skipFirst skips the already-seen
+		// cursor key on each subsequent batch (Seek in reverse lands on the key itself).
+		cursor := append(append([]byte{}, prefix...), 0xFF)
+		skipFirst := false
 		for {
-			rows, err := d.db.Query(`
-				SELECT id, name, object_hash, created_at, created_by_task_id, storage_backend
-				FROM resources
-			WHERE name = ? AND (? = '' OR id > ?)
-			ORDER BY id ASC
-				LIMIT ?`, name, lastID, lastID, scanBatchSize)
+			var resources []Resource
+			var lastKey []byte
+			exhausted := false
+			err := d.resourcePoolDB.View(func(txn *badger.Txn) error {
+				opts := badger.DefaultIteratorOptions
+				opts.Prefix = prefix
+				opts.Reverse = true
+				opts.PrefetchValues = false
+				it := txn.NewIterator(opts)
+				defer it.Close()
+				it.Seek(cursor)
+				if skipFirst && it.ValidForPrefix(prefix) {
+					it.Next()
+				}
+				var scanned int
+				for ; it.ValidForPrefix(prefix); it.Next() {
+					key := it.Item().KeyCopy(nil)
+					lastKey = key
+					scanned++
+					resID := string(key[len(prefix):])
+					r, err := getEntity[Resource](txn, resourceKey(resID))
+					if err != nil {
+						return err
+					}
+					if r != nil {
+						resources = append(resources, *r)
+					}
+					if scanned >= scanBatchSize {
+						return nil
+					}
+				}
+				exhausted = true
+				return nil
+			})
 			if err != nil {
 				dbLogger.Verbosef("Error querying resources by name %s: %v\n", name, err)
-				return
+				break
 			}
-			batch := make([]Resource, 0, scanBatchSize)
-			for rows.Next() {
-				resource, err := resourceFromScanner(rows)
-				if err != nil {
-					rows.Close()
-					dbLogger.Verbosef("Error scanning resources by name %s: %v\n", name, err)
-					return
-				}
-				batch = append(batch, *resource)
-				lastID = resource.ID
+			for _, r := range resources {
+				ch <- r
 			}
-			rows.Close()
-			for _, resource := range batch {
-				ch <- resource
+			if exhausted || lastKey == nil {
+				break
 			}
-			if len(batch) < scanBatchSize {
-				return
-			}
+			cursor = lastKey
+			skipFirst = true
 		}
 	}()
 	return ch
@@ -127,36 +171,42 @@ func (d Database) GetAllResources() chan Resource {
 	ch := make(chan Resource)
 	go func() {
 		defer close(ch)
-		lastID := ""
+		prefix := []byte(prefixResource)
+		cursor := append([]byte{}, prefix...)
 		for {
-			rows, err := d.db.Query(`
-				SELECT id, name, object_hash, created_at, created_by_task_id, storage_backend
-				FROM resources
-				WHERE id > ?
-				ORDER BY id
-				LIMIT ?`, lastID, scanBatchSize)
+			var resources []Resource
+			var lastKey []byte
+			exhausted := false
+			err := d.resourcePoolDB.View(func(txn *badger.Txn) error {
+				opts := badger.DefaultIteratorOptions
+				opts.Prefix = prefix
+				it := txn.NewIterator(opts)
+				defer it.Close()
+				for it.Seek(cursor); it.ValidForPrefix(prefix); it.Next() {
+					lastKey = it.Item().KeyCopy(nil)
+					var r Resource
+					err := it.Item().Value(func(v []byte) error { return decode(v, &r) })
+					if err == nil {
+						resources = append(resources, r)
+					}
+					if len(resources) >= scanBatchSize {
+						return nil
+					}
+				}
+				exhausted = true
+				return nil
+			})
 			if err != nil {
 				dbLogger.Verbosef("Error querying all resources: %v\n", err)
-				return
+				break
 			}
-			batch := make([]Resource, 0, scanBatchSize)
-			for rows.Next() {
-				resource, err := resourceFromScanner(rows)
-				if err != nil {
-					rows.Close()
-					dbLogger.Verbosef("Error scanning all resources: %v\n", err)
-					return
-				}
-				batch = append(batch, *resource)
-				lastID = resource.ID
+			for _, r := range resources {
+				ch <- r
 			}
-			rows.Close()
-			for _, resource := range batch {
-				ch <- resource
+			if exhausted || lastKey == nil {
+				break
 			}
-			if len(batch) < scanBatchSize {
-				return
-			}
+			cursor = append(lastKey, 0x00)
 		}
 	}()
 	return ch
@@ -166,36 +216,46 @@ func (d Database) GetAllResourceNames() chan string {
 	ch := make(chan string)
 	go func() {
 		defer close(ch)
-		lastName := ""
+		prefix := []byte(prefixResource)
+		cursor := append([]byte{}, prefix...)
+		seen := make(map[string]bool) // global dedup across batches
 		for {
-			rows, err := d.db.Query(`
-				SELECT DISTINCT name
-				FROM resources
-				WHERE name > ?
-				ORDER BY name
-				LIMIT ?`, lastName, scanBatchSize)
+			var names []string
+			var lastKey []byte
+			exhausted := false
+			var scanned int
+			err := d.resourcePoolDB.View(func(txn *badger.Txn) error {
+				opts := badger.DefaultIteratorOptions
+				opts.Prefix = prefix
+				it := txn.NewIterator(opts)
+				defer it.Close()
+				for it.Seek(cursor); it.ValidForPrefix(prefix); it.Next() {
+					lastKey = it.Item().KeyCopy(nil)
+					scanned++
+					var r Resource
+					err := it.Item().Value(func(v []byte) error { return decode(v, &r) })
+					if err == nil && !seen[r.Name] {
+						seen[r.Name] = true
+						names = append(names, r.Name)
+					}
+					if scanned >= scanBatchSize {
+						return nil
+					}
+				}
+				exhausted = true
+				return nil
+			})
 			if err != nil {
 				dbLogger.Verbosef("Error querying resource names: %v\n", err)
-				return
+				break
 			}
-			batch := make([]string, 0, scanBatchSize)
-			for rows.Next() {
-				var name string
-				if err := rows.Scan(&name); err != nil {
-					rows.Close()
-					dbLogger.Verbosef("Error scanning resource names: %v\n", err)
-					return
-				}
-				batch = append(batch, name)
-				lastName = name
+			for _, n := range names {
+				ch <- n
 			}
-			rows.Close()
-			for _, name := range batch {
-				ch <- name
+			if exhausted || lastKey == nil {
+				break
 			}
-			if len(batch) < scanBatchSize {
-				return
-			}
+			cursor = append(lastKey, 0x00)
 		}
 	}()
 	return ch
@@ -205,40 +265,73 @@ func (d Database) GetUnconsumedResourcesByName(name string, consumingStepID stri
 	ch := make(chan Resource)
 	go func() {
 		defer close(ch)
-		lastID := ""
+		prefix := idxResourceByNamePrefix(name)
+		cursor := append(append([]byte{}, prefix...), 0xFF)
+		skipFirst := false
 		for {
-			rows, err := d.db.Query(`
-				SELECT r.id, r.name, r.object_hash, r.created_at, r.created_by_task_id, r.storage_backend
-				FROM resources r
-				WHERE r.name = ?
-			  AND (? = '' OR r.id > ?)
-			  AND NOT EXISTS (
-				SELECT 1 FROM tasks t WHERE t.step_id = ? AND t.input_resource_id = r.id
-			  )
-			ORDER BY r.id ASC
-				LIMIT ?`, name, lastID, lastID, consumingStepID, scanBatchSize)
+			var resources []Resource
+			var lastKey []byte
+			exhausted := false
+			err := d.resourcePoolDB.View(func(txn *badger.Txn) error {
+				opts := badger.DefaultIteratorOptions
+				opts.Prefix = prefix
+				opts.Reverse = true
+				opts.PrefetchValues = false
+				it := txn.NewIterator(opts)
+				defer it.Close()
+				it.Seek(cursor)
+				if skipFirst && it.ValidForPrefix(prefix) {
+					it.Next()
+				}
+				var scanned int
+				for ; it.ValidForPrefix(prefix); it.Next() {
+					key := it.Item().KeyCopy(nil)
+					lastKey = key
+					scanned++
+					resID := string(key[len(prefix):])
+					uniqueKey := idxTaskUniqueKey(consumingStepID, resID)
+
+					consumed := false
+					err := d.taskQueueDB.View(func(taskTxn *badger.Txn) error {
+						consumed = keyExists(taskTxn, uniqueKey)
+						return nil
+					})
+					if err != nil {
+						return err
+					}
+
+					if consumed {
+						if scanned >= scanBatchSize {
+							return nil
+						}
+						continue
+					}
+					r, err := getEntity[Resource](txn, resourceKey(resID))
+					if err != nil {
+						return err
+					}
+					if r != nil {
+						resources = append(resources, *r)
+					}
+					if scanned >= scanBatchSize {
+						return nil
+					}
+				}
+				exhausted = true
+				return nil
+			})
 			if err != nil {
 				dbLogger.Verbosef("Error querying unconsumed resources for name %s, step %s: %v\n", name, consumingStepID, err)
-				return
+				break
 			}
-			batch := make([]Resource, 0, scanBatchSize)
-			for rows.Next() {
-				resource, err := resourceFromScanner(rows)
-				if err != nil {
-					rows.Close()
-					dbLogger.Verbosef("Error scanning unconsumed resources for name %s, step %s: %v\n", name, consumingStepID, err)
-					return
-				}
-				batch = append(batch, *resource)
-				lastID = resource.ID
+			for _, r := range resources {
+				ch <- r
 			}
-			rows.Close()
-			for _, resource := range batch {
-				ch <- resource
+			if exhausted || lastKey == nil {
+				break
 			}
-			if len(batch) < scanBatchSize {
-				return
-			}
+			cursor = lastKey
+			skipFirst = true
 		}
 	}()
 	return ch
@@ -246,61 +339,141 @@ func (d Database) GetUnconsumedResourcesByName(name string, consumingStepID stri
 
 func (d Database) CountResources() (int64, error) {
 	var count int64
-	err := d.db.QueryRow(`SELECT COUNT(*) FROM resources`).Scan(&count)
+	err := d.resourcePoolDB.View(func(txn *badger.Txn) error {
+		var err error
+		count, err = prefixCount(txn, []byte(prefixResource))
+		return err
+	})
 	return count, err
 }
 
 func (d Database) DeleteResource(id string) error {
-	_, err := d.db.Exec(`DELETE FROM resources WHERE id = ?`, id)
-	return err
+	var deletedResource *Resource
+	err := d.resourcePoolDB.Update(func(txn *badger.Txn) error {
+		r, err := getEntity[Resource](txn, resourceKey(id))
+		if err != nil || r == nil {
+			return err
+		}
+		deletedResource = r
+		_ = txn.Delete(resourceKey(id))
+		_ = txn.Delete(idxResourceByNameKey(r.Name, id))
+		_ = txn.Delete(idxResourceHashKey(r.Name, r.ObjectHash))
+		return nil
+	})
+	if err != nil || deletedResource == nil {
+		return err
+	}
+
+	return d.stepEngineDB.Update(func(txn *badger.Txn) error {
+		_ = txn.Delete(idxResourceRouteKey(deletedResource.Name, ResourceStatusUnprocessed, id))
+		_ = txn.Delete(idxResourceRouteKey(deletedResource.Name, ResourceStatusProcessing, id))
+		return nil
+	})
 }
 
 func (d Database) DeleteResourceHard(id string) (ResourceDeleteResult, error) {
-	result := ResourceDeleteResult{ResourceID: id}
-	tx, err := d.db.Begin()
-	if err != nil {
-		return result, err
-	}
-	defer tx.Rollback()
-
-	row := tx.QueryRow(`SELECT id, name, object_hash, created_at, created_by_task_id, storage_backend FROM resources WHERE id = ?`, id)
-	resource, err := resourceFromScanner(row)
-	if err == sql.ErrNoRows {
-		if commitErr := tx.Commit(); commitErr != nil {
-			return result, commitErr
+	res := ResourceDeleteResult{ResourceID: id}
+	var deleteFSFile bool
+	err := d.resourcePoolDB.Update(func(txn *badger.Txn) error {
+		r, err := getEntity[Resource](txn, resourceKey(id))
+		if err != nil {
+			return err
 		}
-		return result, nil
-	}
-	if err != nil {
-		return result, err
-	}
-
-	result.Name = resource.Name
-	result.ObjectHash = resource.ObjectHash
-	if _, err := tx.Exec(`DELETE FROM resources WHERE id = ?`, id); err != nil {
-		return result, err
-	}
-	result.ResourceDeleted = true
-
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM resources WHERE object_hash = ?`, resource.ObjectHash).Scan(&result.RemainingObjectRefs); err != nil {
-		return result, err
-	}
-	if err := tx.Commit(); err != nil {
-		return result, err
-	}
-
-	if result.RemainingObjectRefs == 0 {
-		if err := removeObjectFileIfExists(d.objectFilePath(resource.ObjectHash)); err != nil {
-			return result, err
+		if r == nil {
+			return nil
 		}
-		result.ObjectDeleted = true
+
+		res.Name = r.Name
+		res.ObjectHash = r.ObjectHash
+
+		if err := txn.Delete(resourceKey(id)); err != nil {
+			return err
+		}
+		if err := txn.Delete(idxResourceByNameKey(r.Name, id)); err != nil {
+			return err
+		}
+		if err := txn.Delete(idxResourceHashKey(r.Name, r.ObjectHash)); err != nil {
+			return err
+		}
+		res.ResourceDeleted = true
+
+		remainingRefs, err := countResourcesByObjectHashTxn(txn, r.ObjectHash)
+		if err != nil {
+			return err
+		}
+		res.RemainingObjectRefs = remainingRefs
+
+		if remainingRefs > 0 {
+			return nil
+		}
+
+		hashBytes, err := hex.DecodeString(r.ObjectHash)
+		if err != nil {
+			return err
+		}
+
+		item, err := txn.Get(objectKey(hashBytes))
+		if err == badger.ErrKeyNotFound {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+
+		val, err := item.ValueCopy(nil)
+		if err != nil {
+			return err
+		}
+		deleteFSFile = string(val) == fsSentinel
+
+		if err := txn.Delete(objectKey(hashBytes)); err != nil {
+			return err
+		}
+		res.ObjectDeleted = true
+		return nil
+	})
+	if err != nil {
+		return res, err
 	}
 
-	return result, nil
+	if res.ResourceDeleted {
+		if err := d.stepEngineDB.Update(func(txn *badger.Txn) error {
+			_ = txn.Delete(idxResourceRouteKey(res.Name, ResourceStatusUnprocessed, id))
+			_ = txn.Delete(idxResourceRouteKey(res.Name, ResourceStatusProcessing, id))
+			return nil
+		}); err != nil {
+			return res, err
+		}
+	}
+
+	if deleteFSFile {
+		if err := removeObjectFileIfExists(d.objectFilePath(res.ObjectHash)); err != nil {
+			return res, err
+		}
+	}
+
+	return res, nil
 }
 
-func countResourcesByObjectHashTxn(txn *sql.Tx, objectHash string) (int64, error) {
+func countResourcesByObjectHashTxn(txn *badger.Txn, objectHash string) (int64, error) {
 	var count int64
-	err := txn.QueryRow(`SELECT COUNT(*) FROM resources WHERE object_hash = ?`, objectHash).Scan(&count)
-	return count, err
+	prefix := []byte(prefixResource)
+	opts := badger.DefaultIteratorOptions
+	opts.Prefix = prefix
+	opts.PrefetchValues = true
+	it := txn.NewIterator(opts)
+	defer it.Close()
+
+	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+		var r Resource
+		err := it.Item().Value(func(v []byte) error { return decode(v, &r) })
+		if err != nil {
+			return 0, err
+		}
+		if r.ObjectHash == objectHash {
+			count++
+		}
+	}
+
+	return count, nil
 }

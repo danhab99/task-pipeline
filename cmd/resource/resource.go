@@ -10,16 +10,16 @@ import (
 )
 
 var (
-	dbPath *string
+	dbPath string
 )
 
 func RegisterFlags(fs *flag.FlagSet) {
-	dbPath = fs.String("db", "./db", "database path")
+	fs.StringVar(&dbPath, "db", "./db", "database path")
 }
 
 func Execute() {
 	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "Error: missing subcommand (list, get, create, delete)")
+		fmt.Fprintln(os.Stderr, "Error: missing subcommand (names, list, get, create, delete)")
 		printUsage()
 		os.Exit(1)
 	}
@@ -27,13 +27,20 @@ func Execute() {
 	subcommand := os.Args[2]
 
 	switch subcommand {
+	case "names":
+		namesCmd := flag.NewFlagSet("names", flag.ContinueOnError)
+		namesCmd.StringVar(&dbPath, "db", dbPath, "database path")
+		namesCmd.Parse(os.Args[3:])
+		listResourceNames()
 	case "list":
-		listCmd := flag.NewFlagSet("list", flag.ExitOnError)
+		listCmd := flag.NewFlagSet("list", flag.ContinueOnError)
+		listCmd.StringVar(&dbPath, "db", dbPath, "database path")
 		name := listCmd.String("name", "", "filter by resource name")
 		listCmd.Parse(os.Args[3:])
 		listResources(*name)
 	case "get":
-		getCmd := flag.NewFlagSet("get", flag.ExitOnError)
+		getCmd := flag.NewFlagSet("get", flag.ContinueOnError)
+		getCmd.StringVar(&dbPath, "db", dbPath, "database path")
 		id := getCmd.String("id", "", "resource ID to get")
 		getCmd.Parse(os.Args[3:])
 		if *id == "" {
@@ -42,7 +49,8 @@ func Execute() {
 		}
 		getResource(*id)
 	case "create":
-		createCmd := flag.NewFlagSet("create", flag.ExitOnError)
+		createCmd := flag.NewFlagSet("create", flag.ContinueOnError)
+		createCmd.StringVar(&dbPath, "db", dbPath, "database path")
 		name := createCmd.String("name", "", "resource name")
 		hash := createCmd.String("hash", "", "object hash")
 		createCmd.Parse(os.Args[3:])
@@ -52,7 +60,8 @@ func Execute() {
 		}
 		createResource(*name, *hash)
 	case "delete":
-		deleteCmd := flag.NewFlagSet("delete", flag.ExitOnError)
+		deleteCmd := flag.NewFlagSet("delete", flag.ContinueOnError)
+		deleteCmd.StringVar(&dbPath, "db", dbPath, "database path")
 		id := deleteCmd.String("id", "", "resource ID to delete")
 		name := deleteCmd.String("name", "", "delete all resources with this name")
 		deleteCmd.Parse(os.Args[3:])
@@ -76,6 +85,7 @@ func printUsage() {
 	fmt.Println("Usage: grit resource <subcommand> [flags]")
 	fmt.Println()
 	fmt.Println("Available subcommands:")
+	fmt.Println("  names    List unique resource names with counts")
 	fmt.Println("  list     List all resources (optionally filter by -name)")
 	fmt.Println("  get      Get a specific resource by ID (requires -id)")
 	fmt.Println("  create   Create a new resource (requires -name and -hash)")
@@ -87,7 +97,7 @@ func printUsage() {
 }
 
 func listResources(filterName string) {
-	database, err := db.NewDatabase(*dbPath)
+	database, err := db.NewDatabase(	dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error opening database: %v\n", err)
 		os.Exit(1)
@@ -137,8 +147,47 @@ func listResources(filterName string) {
 	}
 }
 
+func listResourceNames() {
+	database, err := db.NewDatabase(	dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error opening database: %v\n", err)
+		os.Exit(1)
+	}
+	defer database.Close()
+
+	counts := make(map[string]int)
+	for r := range database.GetAllResources() {
+		counts[r.Name]++
+	}
+
+	if len(counts) == 0 {
+		fmt.Println("No resources found")
+		return
+	}
+
+	names := make([]string, 0, len(counts))
+	for name := range counts {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	maxNameLen := 0
+	for _, name := range names {
+		if len(name) > maxNameLen {
+			maxNameLen = len(name)
+		}
+	}
+
+	total := 0
+	for _, name := range names {
+		fmt.Printf("  %-*s  %d\n", maxNameLen, name, counts[name])
+		total += counts[name]
+	}
+	fmt.Printf("  %d unique names, %d total resources\n", len(names), total)
+}
+
 func getResource(id string) {
-	database, err := db.NewDatabase(*dbPath)
+	database, err := db.NewDatabase(	dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error opening database: %v\n", err)
 		os.Exit(1)
@@ -167,7 +216,7 @@ func getResource(id string) {
 }
 
 func createResource(name, hash string) {
-	database, err := db.NewDatabase(*dbPath)
+	database, err := db.NewDatabase(	dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error opening database: %v\n", err)
 		os.Exit(1)
@@ -184,7 +233,7 @@ func createResource(name, hash string) {
 }
 
 func deleteResource(id, name string) {
-	database, err := db.NewDatabase(*dbPath)
+	database, err := db.NewDatabase(	dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error opening database: %v\n", err)
 		os.Exit(1)

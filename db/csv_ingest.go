@@ -11,43 +11,65 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
+
+	badger "github.com/dgraph-io/badger/v4"
 )
 
 // getCsvFileHash retrieves the stored hash for a CSV file path, or "" if none.
 func (d *Database) getCsvFileHash(path string) (string, error) {
-	return getMetaValue(d.db, string(metaCsvHashKey(path)))
+	var hash string
+	err := d.resourcePoolDB.View(func(txn *badger.Txn) error {
+		val, err := getVal(txn, metaCsvHashKey(path))
+		if err != nil {
+			return err
+		}
+		if val != nil {
+			hash = string(val)
+		}
+		return nil
+	})
+	return hash, err
 }
 
 // setCsvFileHash stores the hash for a CSV file path.
 func (d *Database) setCsvFileHash(path, hash string) error {
-	return setMetaValue(d.db, string(metaCsvHashKey(path)), hash)
+	return d.resourcePoolDB.Update(func(txn *badger.Txn) error {
+		return txn.Set(metaCsvHashKey(path), []byte(hash))
+	})
 }
 
 // getCsvFileOffset returns the byte offset of the last committed batch for path, or 0.
 func (d *Database) getCsvFileOffset(path string) (int64, error) {
-	val, err := getMetaValue(d.db, string(metaCsvOffsetKey(path)))
-	if err != nil {
-		return 0, err
-	}
-	if val == "" {
-		return 0, nil
-	}
-	offset, err := strconv.ParseInt(val, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid CSV offset value: %w", err)
-	}
-	return offset, nil
+	var offset int64
+	err := d.resourcePoolDB.View(func(txn *badger.Txn) error {
+		val, err := getVal(txn, metaCsvOffsetKey(path))
+		if err != nil {
+			return err
+		}
+		if val != nil {
+			n, err := strconv.ParseInt(string(val), 10, 64)
+			if err != nil {
+				return fmt.Errorf("invalid CSV offset value: %w", err)
+			}
+			offset = n
+		}
+		return nil
+	})
+	return offset, err
 }
 
 // setCsvFileOffset persists the committed byte offset for crash recovery.
 func (d *Database) setCsvFileOffset(path string, offset int64) error {
-	return setMetaValue(d.db, string(metaCsvOffsetKey(path)), strconv.FormatInt(offset, 10))
+	return d.resourcePoolDB.Update(func(txn *badger.Txn) error {
+		return txn.Set(metaCsvOffsetKey(path), []byte(strconv.FormatInt(offset, 10)))
+	})
 }
 
 // deleteCsvFileOffset removes the in-progress offset once ingestion completes.
 func (d *Database) deleteCsvFileOffset(path string) error {
-	return deleteMetaValue(d.db, string(metaCsvOffsetKey(path)))
+	return d.resourcePoolDB.Update(func(txn *badger.Txn) error {
+		return txn.Delete(metaCsvOffsetKey(path))
+	})
 }
 
 // hashFile streams through a file computing its SHA-256 without loading it all into memory.
@@ -131,34 +153,15 @@ func (d *Database) IngestCsvFile(path string, outputName string, columns []strin
 		if len(objectBatch) == 0 {
 			return nil
 		}
-		
-		// Parallel file writes: WaitGroup-based concurrency
-		var wg sync.WaitGroup
-		errChan := make(chan error, len(objectBatch))
-		
 		for _, item := range objectBatch {
-			wg.Add(1)
-			go func(hash string, data []byte) {
-				defer wg.Done()
-				if err := d.StoreObject(hash, data); err != nil {
-					errChan <- fmt.Errorf("failed to store object %s: %w", hash, err)
-				}
-			}(item.hash, item.data)
+			if err := d.StoreObject(item.hash, item.data); err != nil {
+				return fmt.Errorf("failed to store object: %w", err)
+			}
+			backend := d.StorageBackendForSize(len(item.data))
+			if err := d.insertResource(outputName, item.hash, "", backend); err != nil {
+				return fmt.Errorf("failed to create resource: %w", err)
+			}
 		}
-		
-		wg.Wait()
-		close(errChan)
-		
-		// Check for any errors from parallel writes
-		for err := range errChan {
-			return err
-		}
-		
-		// Batch insert resources in a single transaction
-		if err := d.batchInsertResources(outputName, objectBatch); err != nil {
-			return fmt.Errorf("failed to batch insert resources: %w", err)
-		}
-		
 		if err := d.setCsvFileOffset(path, bytePos); err != nil {
 			return fmt.Errorf("failed to save CSV offset: %w", err)
 		}
