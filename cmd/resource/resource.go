@@ -7,10 +7,12 @@ import (
 	"sort"
 
 	"grit/db"
+	"grit/log"
 )
 
 var (
-	dbPath string
+	dbPath    string
+	resLogger = log.NewLogger("resource")
 )
 
 func RegisterFlags(fs *flag.FlagSet) {
@@ -97,7 +99,9 @@ func printUsage() {
 }
 
 func listResources(filterName string) {
-	database, err := db.NewDatabase(	dbPath)
+	resLogger.Verbosef("listing resources, filterName=%q", filterName)
+
+	database, err := db.NewDatabase(dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error opening database: %v\n", err)
 		os.Exit(1)
@@ -106,14 +110,17 @@ func listResources(filterName string) {
 
 	var resources []db.Resource
 	if filterName != "" {
+		resLogger.Verbosef("querying resources by name: %s", filterName)
 		for r := range database.GetResourcesByName(filterName) {
 			resources = append(resources, r)
 		}
 	} else {
+		resLogger.Verbosef("querying all resources")
 		for r := range database.GetAllResources() {
 			resources = append(resources, r)
 		}
 	}
+	resLogger.Verbosef("found %d resources", len(resources))
 
 	if len(resources) == 0 {
 		if filterName != "" {
@@ -142,13 +149,16 @@ func listResources(filterName string) {
 		if r.CreatedByTaskID != nil {
 			createdBy = *r.CreatedByTaskID
 		}
+		resLogger.Verbosef("resource: name=%s id=%s hash=%s", r.Name, r.ID, r.ObjectHash)
 		fmt.Printf("  %-*s  id=%s  hash=%s  created=%s  by_task=%s\n",
 			maxNameLen, r.Name, r.ID, r.ObjectHash, r.CreatedAt, createdBy)
 	}
 }
 
 func listResourceNames() {
-	database, err := db.NewDatabase(	dbPath)
+	resLogger.Verbosef("listing resource names")
+
+	database, err := db.NewDatabase(dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error opening database: %v\n", err)
 		os.Exit(1)
@@ -159,6 +169,7 @@ func listResourceNames() {
 	for r := range database.GetAllResources() {
 		counts[r.Name]++
 	}
+	resLogger.Verbosef("found %d unique resource names", len(counts))
 
 	if len(counts) == 0 {
 		fmt.Println("No resources found")
@@ -187,7 +198,9 @@ func listResourceNames() {
 }
 
 func getResource(id string) {
-	database, err := db.NewDatabase(	dbPath)
+	resLogger.Verbosef("getting resource id=%s", id)
+
+	database, err := db.NewDatabase(dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error opening database: %v\n", err)
 		os.Exit(1)
@@ -200,9 +213,11 @@ func getResource(id string) {
 		os.Exit(1)
 	}
 	if r == nil {
+		resLogger.Verbosef("resource not found for id=%s", id)
 		fmt.Printf("No resource found for id=%s\n", id)
 		return
 	}
+	resLogger.Verbosef("found resource: name=%s hash=%s", r.Name, r.ObjectHash)
 
 	createdBy := "-"
 	if r.CreatedByTaskID != nil {
@@ -216,7 +231,9 @@ func getResource(id string) {
 }
 
 func createResource(name, hash string) {
-	database, err := db.NewDatabase(	dbPath)
+	resLogger.Verbosef("creating resource name=%s hash=%s", name, hash)
+
+	database, err := db.NewDatabase(dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error opening database: %v\n", err)
 		os.Exit(1)
@@ -229,11 +246,18 @@ func createResource(name, hash string) {
 		os.Exit(1)
 	}
 
+	resLogger.Verbosef("created resource id=%s", resourceID)
 	fmt.Printf("Created resource id=%s name=%s hash=%s\n", resourceID, name, hash)
 }
 
 func deleteResource(id, name string) {
-	database, err := db.NewDatabase(	dbPath)
+	if id != "" {
+		resLogger.Verbosef("deleting resource by id=%s", id)
+	} else {
+		resLogger.Verbosef("deleting resources by name=%s", name)
+	}
+
+	database, err := db.NewDatabase(dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error opening database: %v\n", err)
 		os.Exit(1)
@@ -247,14 +271,17 @@ func deleteResource(id, name string) {
 			os.Exit(1)
 		}
 		if !result.ResourceDeleted {
+			resLogger.Verbosef("resource not found for id=%s", id)
 			fmt.Printf("No resource found for id=%s\n", id)
 			return
 		}
 
 		fmt.Printf("Deleted resource id=%s name=%s hash=%s\n", result.ResourceID, result.Name, result.ObjectHash)
 		if result.ObjectDeleted {
+			resLogger.Verbosef("deleted object hash=%s", result.ObjectHash)
 			fmt.Printf("Deleted object hash=%s (remaining_refs=%d)\n", result.ObjectHash, result.RemainingObjectRefs)
 		} else {
+			resLogger.Verbosef("kept object hash=%s (still referenced)", result.ObjectHash)
 			fmt.Printf("Kept object hash=%s (remaining_refs=%d)\n", result.ObjectHash, result.RemainingObjectRefs)
 		}
 		return
@@ -264,6 +291,7 @@ func deleteResource(id, name string) {
 	for r := range database.GetResourcesByName(name) {
 		resourceIDs = append(resourceIDs, r.ID)
 	}
+	resLogger.Verbosef("found %d resources for name=%s", len(resourceIDs), name)
 
 	if len(resourceIDs) == 0 {
 		fmt.Printf("No resources found for name=%s\n", name)
@@ -285,8 +313,12 @@ func deleteResource(id, name string) {
 		if result.ObjectDeleted {
 			objectsDeleted++
 		}
+		if objectsDeleted % 1e5 == 0 {
+			resLogger.Verbosef("Deleted %d resources\n", objectsDeleted)
+		}
 	}
 
+	resLogger.Verbosef("deleted %d resources, %d objects for name=%s", resourcesDeleted, objectsDeleted, name)
 	fmt.Printf("Deleted %d resources for name=%s\n", resourcesDeleted, name)
 	fmt.Printf("Deleted %d unreferenced objects\n", objectsDeleted)
 }
