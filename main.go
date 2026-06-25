@@ -5,10 +5,8 @@ import (
 	"fmt"
 	"os"
 
-	"grit/cmd/delete_resource"
 	"grit/cmd/export"
 	"grit/cmd/progress"
-	"grit/cmd/prune_resources"
 	"grit/cmd/resource"
 	"grit/cmd/run"
 	"grit/cmd/step"
@@ -40,18 +38,6 @@ func main() {
 		progress.RegisterFlags(progressCmd)
 		progressCmd.Parse(os.Args[2:])
 		progress.Execute()
-
-	case "delete":
-		deleteResourceCmd := flag.NewFlagSet("delete", flag.ExitOnError)
-		delete_resource.RegisterFlags(deleteResourceCmd)
-		deleteResourceCmd.Parse(os.Args[2:])
-		delete_resource.Execute()
-
-	case "prune":
-		pruneResourcesCmd := flag.NewFlagSet("prune", flag.ExitOnError)
-		prune_resources.RegisterFlags(pruneResourcesCmd)
-		pruneResourcesCmd.Parse(os.Args[2:])
-		prune_resources.Execute()
 
 	case "help", "-h", "--help":
 		printUsage()
