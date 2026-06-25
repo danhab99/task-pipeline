@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 
 	"grit/db"
 	"grit/log"
@@ -65,17 +66,17 @@ func Execute() {
 		deleteCmd := flag.NewFlagSet("delete", flag.ContinueOnError)
 		deleteCmd.StringVar(&dbPath, "db", dbPath, "database path")
 		id := deleteCmd.String("id", "", "resource ID to delete")
-		name := deleteCmd.String("name", "", "delete all resources with this name")
+		names := deleteCmd.String("names", "", "delete all resources with these names (comma-separated)")
 		deleteCmd.Parse(os.Args[3:])
-		if *id == "" && *name == "" {
-			fmt.Fprintln(os.Stderr, "Error: specify exactly one of -id or -name for delete subcommand")
+		if *id == "" && *names == "" {
+			fmt.Fprintln(os.Stderr, "Error: specify exactly one of -id or -names for delete subcommand")
 			os.Exit(1)
 		}
-		if *id != "" && *name != "" {
-			fmt.Fprintln(os.Stderr, "Error: specify exactly one of -id or -name for delete subcommand")
+		if *id != "" && *names != "" {
+			fmt.Fprintln(os.Stderr, "Error: specify exactly one of -id or -names for delete subcommand")
 			os.Exit(1)
 		}
-		deleteResource(*id, *name)
+		deleteResource(*id, *names)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown subcommand: %s\n\n", subcommand)
 		printUsage()
@@ -91,7 +92,7 @@ func printUsage() {
 	fmt.Println("  list     List all resources (optionally filter by -name)")
 	fmt.Println("  get      Get a specific resource by ID (requires -id)")
 	fmt.Println("  create   Create a new resource (requires -name and -hash)")
-	fmt.Println("  delete   Delete a resource by ID or name (requires -id or -name)")
+	fmt.Println("  delete   Delete a resource by ID or names (requires -id or -names)")
 	fmt.Println()
 	fmt.Println("Flags:")
 	fmt.Println("  -db string")
@@ -250,13 +251,7 @@ func createResource(name, hash string) {
 	fmt.Printf("Created resource id=%s name=%s hash=%s\n", resourceID, name, hash)
 }
 
-func deleteResource(id, name string) {
-	if id != "" {
-		resLogger.Verbosef("deleting resource by id=%s", id)
-	} else {
-		resLogger.Verbosef("deleting resources by name=%s", name)
-	}
-
+func deleteResource(id, names string) {
 	database, err := db.NewDatabase(dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error opening database: %v\n", err)
@@ -265,6 +260,7 @@ func deleteResource(id, name string) {
 	defer database.Close()
 
 	if id != "" {
+		resLogger.Verbosef("deleting resource by id=%s", id)
 		result, err := database.DeleteResourceHard(id)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error deleting resource %s: %v\n", id, err)
@@ -287,38 +283,37 @@ func deleteResource(id, name string) {
 		return
 	}
 
-	resourceIDs := make([]string, 0)
-	for r := range database.GetResourcesByName(name) {
-		resourceIDs = append(resourceIDs, r.ID)
-	}
-	resLogger.Verbosef("found %d resources for name=%s", len(resourceIDs), name)
-
-	if len(resourceIDs) == 0 {
-		fmt.Printf("No resources found for name=%s\n", name)
-		return
+	resourceNames := strings.Split(names, ",")
+	for i := range resourceNames {
+		resourceNames[i] = strings.TrimSpace(resourceNames[i])
 	}
 
-	resourcesDeleted := 0
-	objectsDeleted := 0
-	for _, resourceID := range resourceIDs {
-		result, err := database.DeleteResourceHard(resourceID)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error deleting resource %s: %v\n", resourceID, err)
-			os.Exit(1)
-		}
-		if !result.ResourceDeleted {
+	totalResources := 0
+	totalObjects := 0
+	for i, name := range resourceNames {
+		if name == "" {
 			continue
 		}
-		resourcesDeleted++
-		if result.ObjectDeleted {
-			objectsDeleted++
+		resLogger.Verbosef("[%d/%d] deleting resources by name=%s", i+1, len(resourceNames), name)
+		result, err := database.DeleteResourcesByName(name)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error deleting resources for name %s: %v\n", name, err)
+			os.Exit(1)
 		}
-		if objectsDeleted % 1e5 == 0 {
-			resLogger.Verbosef("Deleted %d resources\n", objectsDeleted)
+		if result.ResourcesDeleted == 0 {
+			resLogger.Verbosef("[%d/%d] no resources found for name=%s", i+1, len(resourceNames), name)
+			fmt.Printf("No resources found for name=%s\n", name)
+			continue
 		}
+		resLogger.Verbosef("[%d/%d] deleted %d resources, %d objects for name=%s", i+1, len(resourceNames), result.ResourcesDeleted, result.ObjectsDeleted, name)
+		fmt.Printf("Deleted %d resources for name=%s\n", result.ResourcesDeleted, name)
+		totalResources += result.ResourcesDeleted
+		totalObjects += result.ObjectsDeleted
 	}
 
-	resLogger.Verbosef("deleted %d resources, %d objects for name=%s", resourcesDeleted, objectsDeleted, name)
-	fmt.Printf("Deleted %d resources for name=%s\n", resourcesDeleted, name)
-	fmt.Printf("Deleted %d unreferenced objects\n", objectsDeleted)
+	if totalResources > 0 {
+		fmt.Printf("Deleted %d unreferenced objects\n", totalObjects)
+		resLogger.Verbosef("deleted %d resources, %d objects total across %d names", totalResources, totalObjects, len(resourceNames))
+		resLogger.Verbosef("compaction handled automatically by Badger background goroutines")
+	}
 }

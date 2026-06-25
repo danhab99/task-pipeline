@@ -455,6 +455,126 @@ func (d Database) DeleteResourceHard(id string) (ResourceDeleteResult, error) {
 	return res, nil
 }
 
+type BulkResourceDeleteResult struct {
+	ResourcesDeleted int
+	ObjectsDeleted   int
+	DeletedResources []ResourceDeleteResult
+}
+
+func (d Database) DeleteResourcesByName(name string) (BulkResourceDeleteResult, error) {
+	var result BulkResourceDeleteResult
+	var deleteFSFiles []string
+
+	dbLogger.Verbosef("DeleteResourcesByName: scanning prefix for name=%s", name)
+	err := d.resourcePoolDB.Update(func(txn *badger.Txn) error {
+		prefix := idxResourceByNamePrefix(name)
+		return prefixScanKeys(txn, prefix, func(key []byte) (bool, error) {
+			resID := string(key[len(prefix):])
+			r, err := getEntity[Resource](txn, resourceKey(resID))
+			if err != nil {
+				return false, err
+			}
+			if r == nil {
+				return true, nil
+			}
+
+			dbLogger.Verbosef("  deleting resource id=%s hash=%s", resID, r.ObjectHash)
+
+			if err := txn.Delete(resourceKey(resID)); err != nil {
+				return false, err
+			}
+			if err := txn.Delete(idxResourceByNameKey(r.Name, resID)); err != nil {
+				return false, err
+			}
+			if err := txn.Delete(idxResourceHashKey(r.Name, r.ObjectHash)); err != nil {
+				return false, err
+			}
+
+			dbLogger.Verbosef("  counting remaining refs for hash=%s", r.ObjectHash)
+			remainingRefs, err := countResourcesByObjectHashTxn(txn, r.ObjectHash)
+			if err != nil {
+				return false, err
+			}
+			dbLogger.Verbosef("  remaining refs for hash=%s: %d", r.ObjectHash, remainingRefs)
+
+			rd := ResourceDeleteResult{
+				ResourceID:          resID,
+				Name:                r.Name,
+				ObjectHash:          r.ObjectHash,
+				ResourceDeleted:     true,
+				RemainingObjectRefs: remainingRefs,
+			}
+
+			if remainingRefs == 0 {
+				hashBytes, err := hex.DecodeString(r.ObjectHash)
+				if err != nil {
+					return false, err
+				}
+
+				item, err := txn.Get(objectKey(hashBytes))
+				if err == badger.ErrKeyNotFound {
+					// Object already gone (e.g. previously deleted)
+					rd.ObjectDeleted = true
+					result.DeletedResources = append(result.DeletedResources, rd)
+					result.ResourcesDeleted++
+					return true, nil
+				}
+				if err != nil {
+					return false, err
+				}
+
+				val, err := item.ValueCopy(nil)
+				if err != nil {
+					return false, err
+				}
+
+				if err := txn.Delete(objectKey(hashBytes)); err != nil {
+					return false, err
+				}
+				rd.ObjectDeleted = true
+				result.ObjectsDeleted++
+
+				if string(val) == fsSentinel {
+					deleteFSFiles = append(deleteFSFiles, d.objectFilePath(r.ObjectHash))
+				}
+			}
+
+			result.DeletedResources = append(result.DeletedResources, rd)
+			result.ResourcesDeleted++
+			if len(result.DeletedResources)%1000 == 0 {
+				dbLogger.Verbosef("Deleted %d resources\n", result.ResourcesDeleted)
+			}
+			return true, nil
+		})
+	})
+	if err != nil {
+		return result, err
+	}
+
+	// Clean up router keys in stepEngineDB for all deleted resources
+	if result.ResourcesDeleted > 0 {
+		err = d.stepEngineDB.Update(func(txn *badger.Txn) error {
+			for _, rd := range result.DeletedResources {
+				_ = txn.Delete(idxResourceRouteKey(rd.Name, ResourceStatusUnprocessed, rd.ResourceID))
+				_ = txn.Delete(idxResourceRouteKey(rd.Name, ResourceStatusProcessing, rd.ResourceID))
+			}
+			return nil
+		})
+		if err != nil {
+			return result, err
+		}
+	}
+
+	// Delete filesystem objects outside the transaction
+	for _, path := range deleteFSFiles {
+		if err := removeObjectFileIfExists(path); err != nil {
+			return result, err
+		}
+	}
+
+	return result, nil
+}
+
 func countResourcesByObjectHashTxn(txn *badger.Txn, objectHash string) (int64, error) {
 	var count int64
 	prefix := []byte(prefixResource)
