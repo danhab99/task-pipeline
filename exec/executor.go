@@ -10,8 +10,9 @@ import (
 	"grit/types"
 	"os"
 	"os/exec"
-	"syscall"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -105,8 +106,13 @@ func (e *ScriptExecutor) Execute(task types.Task, step types.Step) error {
 		if entry.IsDir() {
 			continue
 		}
+		name := entry.Name()
+		if idx := strings.LastIndex(name, "_"); idx != -1 {
+			name = name[:idx]
+		}
 		path := outputDir + "/" + entry.Name()
-		if err := e.db.IngestFile(path, entry.Name(), task.ID); err != nil {
+
+		if err := e.db.IngestFile(path, name, task.ID); err != nil {
 			return fmt.Errorf("failed to ingest output file %s: %w", entry.Name(), err)
 		}
 	}
@@ -265,5 +271,3 @@ func (e *ScriptExecutor) runScriptWithTimeout(cmd *exec.Cmd, step types.Step, ti
 		return ErrTimeout
 	}
 }
-
-
