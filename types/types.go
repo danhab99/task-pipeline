@@ -34,7 +34,7 @@ type Resource struct {
 	ObjectHash      string  `msgpack:"object_hash"`
 	CreatedAt       string  `msgpack:"created_at"`
 	CreatedByTaskID *string `msgpack:"created_by_task_id,omitempty"`
-	StorageBackend  string  `msgpack:"storage_backend,omitempty"`
+	Data            []byte  `msgpack:"data,omitempty"`
 }
 
 func (t Task) String() string {

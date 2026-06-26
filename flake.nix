@@ -25,7 +25,7 @@
           pname = "grit";
           version = import ./changelog;
           src = self;
-          vendorHash = "sha256-b1mYYutIi5oa0w+ACn8qGgw1t362ZCbKShSZqFlrVWk=";
+          vendorHash = "sha256-UmY1vK/xA+NuuXLEhUO9/mlJqAkZOgga6HcFF5zqvb4=";
           subPackages = [ "." ];
           ldflags = [
             "-s"

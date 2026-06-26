@@ -1,121 +1,108 @@
 package db
 
 import (
-	"fmt"
-	"grit/log"
-	"os"
+	"crypto/sha256"
+	"encoding/hex"
+	"grit/types"
+	"grit/wal"
+	"path"
 	"time"
 
-	badger "github.com/dgraph-io/badger/v4"
+	"github.com/bits-and-blooms/bloom/v3"
+	"github.com/oklog/ulid/v2"
 )
 
-var dbLogger = log.NewLogger("DB")
-
 type Database struct {
-	repoPath       string
-	stepEngineDB   *badger.DB
-	taskQueueDB    *badger.DB
-	resourcePoolDB *badger.DB
+	resources        wal.WalSet
+	unprocessedTasks wal.WalSet
+	processedTasks   wal.WalSet
+	dir              string
 }
 
-func baseBadgerOptions(path string) badger.Options {
-	opts := badger.DefaultOptions(path)
-	opts.Logger = nil
-	opts.SyncWrites = false
-	opts.BlockCacheSize = 32 << 20
-	opts.NumVersionsToKeep = 1
-	opts.CompactL0OnClose = false
-	opts.NumLevelZeroTables = 5
-	opts.NumLevelZeroTablesStall = 10
-	opts.NumCompactors = 2 // Badger v4 requires at least 2 compactors.
-	return opts
-}
-
-func openBadgerAt(path string, opts badger.Options) (*badger.DB, error) {
-	db, err := badger.Open(opts)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open BadgerDB at %s: %w", path, err)
-	}
-	return db, nil
-}
-
-func NewDatabase(repo_path string) (Database, error) {
-	err := os.MkdirAll(repo_path, 0755)
-	if err != nil {
-		return Database{}, err
-	}
-
-	stepPath := repo_path + "/db/step_engine"
-	taskPath := repo_path + "/db/task_queue"
-	resourcePath := repo_path + "/db/resource_pool"
-
-	if err := os.MkdirAll(stepPath, 0755); err != nil {
-		return Database{}, err
-	}
-	if err := os.MkdirAll(taskPath, 0755); err != nil {
-		return Database{}, err
-	}
-	if err := os.MkdirAll(resourcePath, 0755); err != nil {
-		return Database{}, err
-	}
-
-	dbLogger.Verbosef("Opening BadgerDB step_engine at %s\n", stepPath)
-	stepOpts := baseBadgerOptions(stepPath)
-	stepOpts.ValueThreshold = 1024
-	stepOpts.MemTableSize = 32 << 20
-	stepOpts.BaseTableSize = 2 << 20
-	stepOpts.ValueLogFileSize = 64 << 20
-	stepOpts.NumMemtables = 2
-	stepEngineDB, err := openBadgerAt(stepPath, stepOpts)
-	if err != nil {
-		return Database{}, err
-	}
-
-	dbLogger.Verbosef("Opening BadgerDB task_queue at %s\n", taskPath)
-	taskOpts := baseBadgerOptions(taskPath)
-	taskOpts.ValueThreshold = 1024
-	taskOpts.MemTableSize = 32 << 20
-	taskOpts.BaseTableSize = 2 << 20
-	taskOpts.ValueLogFileSize = 64 << 20
-	taskOpts.NumMemtables = 2
-	taskQueueDB, err := openBadgerAt(taskPath, taskOpts)
-	if err != nil {
-		_ = stepEngineDB.Close()
-		return Database{}, err
-	}
-
-	dbLogger.Verbosef("Opening BadgerDB resource_pool at %s\n", resourcePath)
-	resourceOpts := baseBadgerOptions(resourcePath)
-	resourceOpts.ValueThreshold = 1024
-	resourceOpts.MemTableSize = 64 << 20
-	resourceOpts.BaseTableSize = 8 << 20
-	resourceOpts.ValueLogFileSize = 512 << 20
-	resourceOpts.NumMemtables = 3
-	resourcePoolDB, err := openBadgerAt(resourcePath, resourceOpts)
-	if err != nil {
-		_ = taskQueueDB.Close()
-		_ = stepEngineDB.Close()
-		return Database{}, err
-	}
-
-	dbLogger.Println("Database ready")
+func NewDatabase(dir string) Database {
 	return Database{
-		repoPath:       repo_path,
-		stepEngineDB:   stepEngineDB,
-		taskQueueDB:    taskQueueDB,
-		resourcePoolDB: resourcePoolDB,
-	}, nil
+		resources:        wal.NewWalSet(path.Join(dir, "resources")),
+		unprocessedTasks: wal.NewWalSet(path.Join(dir, "unprocessed_tasks")),
+		processedTasks:   wal.NewWalSet(path.Join(dir, "processed_tasks")),
+		dir:              dir,
+	}
 }
 
-func (d Database) Close() error {
-	if err := d.stepEngineDB.Close(); err != nil {
-		return fmt.Errorf("failed to close step_engine DB: %w", err)
+func (d Database) Close() {
+	d.resources.Close()
+	d.processedTasks.Close()
+	d.unprocessedTasks.Close()
+}
+
+func (d Database) CreateTask(step types.Step, resource types.Resource) types.Task {
+	t := types.Task{
+		ID:              ulid.Make().String(),
+		StepID:          step.ID,
+		InputResourceID: &resource.ID,
+		Processed:       false,
+		Error:           nil,
 	}
-	if err := d.taskQueueDB.Close(); err != nil {
-		return fmt.Errorf("failed to close task_queue DB: %w", err)
+
+	tl := d.unprocessedTasks.Get(step.Name)
+
+	tl.Append(map[string]string{
+		"step_id":     step.ID,
+		"resource_id": resource.ID,
+	}, t)
+
+	return t
+}
+
+func (d Database) CreateResource(step types.Step, task types.Task, name string, data []byte) types.Resource {
+	h := sha256.Sum256(data)
+
+	r := types.Resource{
+		ID:              ulid.Make().String(),
+		Name:            name,
+		CreatedByTaskID: &task.ID,
+		CreatedAt:       time.Now().String(),
+		ObjectHash:      hex.EncodeToString(h[:]),
+		Data:            data,
 	}
-	if err := d.resourcePoolDB.Close(); err != nil {
-		return fmt.Errorf("failed to close resource_pool DB: %w", err)
+
+	l := d.resources.Get(name)
+	l.Append(map[string]string{
+		"name":       name,
+		"input_task": task.ID,
+	}, r)
+
+	d.processedTasks.Get(step.Name).Append(nil, task.ID)
+
+	return r
+}
+
+func (d Database) IterateUnprocessedTasks(name string, out chan<- types.Task) {
+	processed_tasks := d.processedTasks.Get(name)
+	processed_filter := bloom.NewWithEstimates(uint(processed_tasks.Count()), 0.01)
+	iter := processed_tasks.Iterate("", "")
+
+	for {
+		var t string
+		err := iter(&t)
+		if err == nil {
+			processed_filter.Add([]byte(t))
+		} else {
+			break
+		}
 	}
-	return nil
+
+	iter = d.unprocessedTasks.Get(name).Iterate("", "")
+
+	for {
+		var t types.Task
+		err := iter(&t)
+
+		if err != nil {
+			break
+		}
+
+		if !processed_filter.Test([]byte(t.ID)) {
+			out <- t
+		}
+	}
 }

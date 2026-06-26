@@ -37,9 +37,21 @@ func (w WriteAheadLog) Append(obj any) int64 {
 func (w WriteAheadLog) Iterate() func(obj any) error {
 	decoder := msgpack.NewDecoder(w.file)
 
+	decoder.Skip()
+
 	return func(obj any) error {
 		return decoder.Decode(obj)
 	}
+}
+
+func (w WriteAheadLog) Count() (c int) {
+	decoder := msgpack.NewDecoder(w.file)
+
+	for err := decoder.Skip(); err != nil; {
+		c++
+	}
+
+	return
 }
 
 type IndexedWriteAheadLog struct {
@@ -85,11 +97,15 @@ func (irw IndexedWriteAheadLog) Append(index map[string]string, obj any) {
 	}
 }
 
-func (irw IndexedWriteAheadLog) Iterate(key, value string) func(obj any) {
+func (irw IndexedWriteAheadLog) Iterate(key, value string) func(obj any) error {
+	if key == "" {
+		return irw.values.Iterate()
+	}
+
 	pos := irw.index[key].Iterate()
 	iter := irw.values.Iterate()
 
-	return func(obj any) {
+	return func(obj any) error {
 		var ikp indexKeyPair
 
 		for ikp.Value != value {
@@ -98,9 +114,13 @@ func (irw IndexedWriteAheadLog) Iterate(key, value string) func(obj any) {
 
 		_, err := irw.values.file.Seek(ikp.Position, 0)
 		if err != nil {
-			panic(err)
+			return err
 		}
 
-		iter(obj)
+		return iter(obj)
 	}
+}
+
+func (irw IndexedWriteAheadLog) Count() (c int) {
+	return irw.values.Count()
 }
