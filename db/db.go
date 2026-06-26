@@ -119,34 +119,3 @@ func (d Database) Close() error {
 	}
 	return nil
 }
-
-// StartValueLogGC runs badger's value-log garbage collector in a background
-// goroutine. It fires every interval and keeps running until the stop channel
-// is closed. Call this once after opening the database.
-//
-// Without periodic GC, vlog files accumulate dead versions from overwritten
-// keys (task status updates, etc.) and stay mmap'd, growing RSS without bound.
-func (d Database) StartValueLogGC(interval time.Duration, stop <-chan struct{}) {
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				// Reclaim vlogs where >30% of space is dead.
-				for _, handle := range []*badger.DB{d.stepEngineDB, d.taskQueueDB, d.resourcePoolDB} {
-					for {
-						if err := handle.RunValueLogGC(0.3); err != nil {
-							break // ErrNoRewrite means nothing left to reclaim
-						}
-					}
-				}
-				dbLogger.Verbosef("Value log GC complete\n")
-			case <-stop:
-				return
-			}
-		}
-	}()
-}
-
-

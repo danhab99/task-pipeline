@@ -18,10 +18,6 @@ type ResourceDeleteResult struct {
 	RemainingObjectRefs int64
 }
 
-func (d Database) CreateResource(name string, objectHash string) (string, error) {
-	return d.CreateResourceWithTask(name, objectHash, nil)
-}
-
 func (d Database) CreateResourceWithTask(name string, objectHash string, createdByTaskID *string) (string, error) {
 	var resultID string
 	err := d.resourcePoolDB.Update(func(txn *badger.Txn) error {
