@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"io"
 	"os"
 	"path"
 
@@ -12,7 +13,7 @@ type WriteAheadLog struct {
 }
 
 func NewWriteAheadLog(dir string) WriteAheadLog {
-	f, err := os.OpenFile(dir+".wal", os.O_APPEND+os.O_CREATE, os.ModeAppend)
+	f, err := os.OpenFile(dir+".wal", os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		panic(err)
 	}
@@ -21,13 +22,18 @@ func NewWriteAheadLog(dir string) WriteAheadLog {
 }
 
 func (w WriteAheadLog) Close() {
-	w.Close()
+	w.file.Close()
 }
 
 func (w WriteAheadLog) Append(obj any) int64 {
-	startPos, err := w.file.Seek(0, 0)
-	err = msgpack.NewEncoder(w.file).Encode(obj)
+	startPos, err := w.file.Seek(0, io.SeekEnd)
 	if err != nil {
+		panic(err)
+	}
+	if err = msgpack.NewEncoder(w.file).Encode(obj); err != nil {
+		panic(err)
+	}
+	if err = w.file.Sync(); err != nil {
 		panic(err)
 	}
 
@@ -35,9 +41,10 @@ func (w WriteAheadLog) Append(obj any) int64 {
 }
 
 func (w WriteAheadLog) Iterate() func(obj any) error {
+	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
+		panic(err)
+	}
 	decoder := msgpack.NewDecoder(w.file)
-
-	decoder.Skip()
 
 	return func(obj any) error {
 		return decoder.Decode(obj)
@@ -45,9 +52,12 @@ func (w WriteAheadLog) Iterate() func(obj any) error {
 }
 
 func (w WriteAheadLog) Count() (c int) {
+	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
+		panic(err)
+	}
 	decoder := msgpack.NewDecoder(w.file)
 
-	for err := decoder.Skip(); err != nil; {
+	for err := decoder.Skip(); err == nil; err = decoder.Skip() {
 		c++
 	}
 
@@ -71,7 +81,7 @@ func NewIndexedWriteAheadLog(dir string) IndexedWriteAheadLog {
 func (irw IndexedWriteAheadLog) Close() {
 	irw.values.Close()
 	for _, w := range irw.index {
-		w.Close()
+		w.file.Close()
 	}
 }
 
@@ -102,22 +112,30 @@ func (irw IndexedWriteAheadLog) Iterate(key, value string) func(obj any) error {
 		return irw.values.Iterate()
 	}
 
-	pos := irw.index[key].Iterate()
-	iter := irw.values.Iterate()
+	indexWal, exists := irw.index[key]
+	if !exists {
+		return func(obj any) error { return io.EOF }
+	}
+
+	pos := indexWal.Iterate()
 
 	return func(obj any) error {
 		var ikp indexKeyPair
-
-		for ikp.Value != value {
-			pos(&ikp)
+		for {
+			if err := pos(&ikp); err != nil {
+				return err
+			}
+			if ikp.Value == value {
+				break
+			}
 		}
 
-		_, err := irw.values.file.Seek(ikp.Position, 0)
-		if err != nil {
+		if _, err := irw.values.file.Seek(ikp.Position, io.SeekStart); err != nil {
 			return err
 		}
 
-		return iter(obj)
+		// Fresh decoder after seek — stale decoder buffers would corrupt reads.
+		return msgpack.NewDecoder(irw.values.file).Decode(obj)
 	}
 }
 

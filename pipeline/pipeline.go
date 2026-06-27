@@ -120,21 +120,21 @@ func (p *Pipeline) ExecuteStep(step types.Step, maxParallel int) int64 {
 		flush()
 	}()
 
-		workers.Parallel0(taskChan, *pr, func(task types.Task) {
-			pipelineLogger.Verbosef("Executing task %s for step %s\n", task.ID, step.Name)
+	workers.Parallel0(taskChan, *pr, func(task types.Task) {
+		pipelineLogger.Verbosef("Executing task %s for step %s\n", task.ID, step.Name)
 
-			execErr := p.executor.Execute(task, step)
+		execErr := p.executor.Execute(task, step)
 
-			var errorMsg *string
-			if execErr != nil && !errors.Is(execErr, exec.ErrTimeout) {
-				msg := execErr.Error()
-				errorMsg = &msg
-				pipelineLogger.Printf("Task %s failed: %v\n", task.ID, execErr)
-			}
+		var errorMsg *string
+		if execErr != nil && !errors.Is(execErr, exec.ErrTimeout) {
+			msg := execErr.Error()
+			errorMsg = &msg
+			pipelineLogger.Printf("Task %s failed: %v\n", task.ID, execErr)
+		}
 
-			updateCh <- db.TaskStatusUpdate{ID: task.ID, Processed: true, Error: errorMsg}
-			executionCount.Add(1)
-		})
+		updateCh <- db.TaskStatusUpdate{ID: task.ID, Processed: true, Error: errorMsg}
+		executionCount.Add(1)
+	})
 
 	close(updateCh)
 	flusherDone.Wait()
@@ -145,5 +145,3 @@ func (p *Pipeline) ExecuteStep(step types.Step, maxParallel int) int64 {
 
 	return executionCount.Load()
 }
-
-

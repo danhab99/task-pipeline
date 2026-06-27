@@ -76,8 +76,8 @@ func (d Database) CreateResource(step types.Step, task types.Task, name string, 
 	return r
 }
 
-func (d Database) IterateUnprocessedTasks(name string, out chan<- types.Task) {
-	processed_tasks := d.processedTasks.Get(name)
+func (d Database) IterateUnprocessedTasks(step types.Step, out chan<- types.Task) {
+	processed_tasks := d.processedTasks.Get(step.Name)
 	processed_filter := bloom.NewWithEstimates(uint(processed_tasks.Count()), 0.01)
 	iter := processed_tasks.Iterate("", "")
 
@@ -91,7 +91,7 @@ func (d Database) IterateUnprocessedTasks(name string, out chan<- types.Task) {
 		}
 	}
 
-	iter = d.unprocessedTasks.Get(name).Iterate("", "")
+	iter = d.unprocessedTasks.Get(step.Name).Iterate("", "")
 
 	for {
 		var t types.Task
