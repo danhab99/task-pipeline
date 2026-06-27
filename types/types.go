@@ -6,21 +6,29 @@ import (
 )
 
 type Step struct {
-	ID       string         `msgpack:"id"`
-	Name     string         `msgpack:"name"`
-	Script   string         `msgpack:"script"`
-	Parallel *int           `msgpack:"parallel,omitempty"`
-	Input    string         `msgpack:"input,omitempty"`
-	Timeout  *time.Duration `msgpack:"timeout,omitempty"`
-	Version  int            `msgpack:"version"`
+	Name       string         `msgpack:"name"`
+	Script     string         `msgpack:"script"`
+	ScriptHash string         `msgpack:"script_hash"`
+	Parallel   *int           `msgpack:"parallel,omitempty"`
+	Input      string         `msgpack:"input,omitempty"`
+	Timeout    *time.Duration `msgpack:"timeout,omitempty"`
+	Version    int            `msgpack:"version"`
+}
+
+func (s Step) ID() string {
+	return s.Name + s.ScriptHash
 }
 
 type Task struct {
-	ID              string  `msgpack:"id"`
+	Id              string  `msgpack:"id"`
 	StepID          string  `msgpack:"step_id"`
 	InputResourceID *string `msgpack:"input_resource_id,omitempty"`
 	Processed       bool    `msgpack:"processed"`
 	Error           *string `msgpack:"error,omitempty"`
+}
+
+func (t Task) ID() string {
+	return t.Id
 }
 
 const (
@@ -29,12 +37,15 @@ const (
 )
 
 type Resource struct {
-	ID              string  `msgpack:"id"`
 	Name            string  `msgpack:"name"`
 	ObjectHash      string  `msgpack:"object_hash"`
 	CreatedAt       string  `msgpack:"created_at"`
 	CreatedByTaskID *string `msgpack:"created_by_task_id,omitempty"`
 	Data            []byte  `msgpack:"data,omitempty"`
+}
+
+func (r Resource) ID() string {
+	return *r.CreatedByTaskID + r.ObjectHash
 }
 
 func (t Task) String() string {

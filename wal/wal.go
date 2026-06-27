@@ -5,6 +5,7 @@ import (
 	"os"
 	"path"
 
+	"github.com/bits-and-blooms/bloom/v3"
 	"github.com/vmihailenco/msgpack/v5"
 )
 
@@ -13,6 +14,8 @@ type WriteAheadLog struct {
 }
 
 func NewWriteAheadLog(dir string) WriteAheadLog {
+	os.MkdirAll(path.Dir(dir))
+
 	f, err := os.OpenFile(dir+".wal", os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		panic(err)
@@ -65,16 +68,18 @@ func (w WriteAheadLog) Count() (c int) {
 }
 
 type IndexedWriteAheadLog struct {
-	values WriteAheadLog
-	index  map[string]WriteAheadLog
-	dir    string
+	values  WriteAheadLog
+	index   map[string]WriteAheadLog
+	dir     string
+	filters map[string]*bloom.BloomFilter
 }
 
 func NewIndexedWriteAheadLog(dir string) IndexedWriteAheadLog {
 	return IndexedWriteAheadLog{
-		dir:    dir,
-		values: NewWriteAheadLog(path.Join(dir, "values")),
-		index:  make(map[string]WriteAheadLog),
+		dir:     dir,
+		values:  NewWriteAheadLog(path.Join(dir, "values")),
+		index:   make(map[string]WriteAheadLog),
+		filters: make(map[string]*bloom.BloomFilter),
 	}
 }
 
@@ -104,6 +109,12 @@ func (irw IndexedWriteAheadLog) Append(index map[string]string, obj any) {
 			Value:    value,
 			Position: valuePos,
 		})
+
+		indexFilter, exists := irw.filters[key]
+		if !exists {
+			indexFilter = bloom.NewWithEstimates(1e8, 0.01)
+		}
+		indexFilter.Add([]byte(value))
 	}
 }
 
@@ -141,4 +152,19 @@ func (irw IndexedWriteAheadLog) Iterate(key, value string) func(obj any) error {
 
 func (irw IndexedWriteAheadLog) Count() (c int) {
 	return irw.values.Count()
+}
+
+func (irw IndexedWriteAheadLog) Contains(key, value string) bool {
+	filter, exists := irw.filters[key]
+	if !exists {
+		return false
+	}
+
+	mightExist := filter.Test([]byte(value))
+	if !mightExist {
+		return false
+	}
+
+	iter := irw.Iterate(key, value)
+	return iter(nil) == nil
 }

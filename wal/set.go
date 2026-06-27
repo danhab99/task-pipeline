@@ -29,3 +29,12 @@ func (w WalSet) Get(name string) IndexedWriteAheadLog {
 	}
 	return w.logs[name]
 }
+
+func (w WalSet) Keys() []string {
+	keys := make([]string, 0, len(w.logs))
+	for k := range w.logs {
+		keys = append(keys, k)
+	}
+
+	return keys
+}
